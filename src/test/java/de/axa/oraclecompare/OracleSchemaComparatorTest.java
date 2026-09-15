@@ -16,6 +16,7 @@ import javax.xml.parsers.DocumentBuilderFactory;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.xml.sax.InputSource;
@@ -491,9 +492,369 @@ class OracleSchemaComparatorTest {
         assertEquals(write(forward, "forward.sql"), write(reverse, "reverse.sql"));
     }
 
+    @ParameterizedTest
+    @EnumSource(Type.class)
+    void excludesExactAndWildcardNamesFromCreateAlterAndDropForEveryObjectType(Type type) throws Exception {
+        DbObject base = object(Type.TABLE, "BASE");
+        String tableName = type == Type.INDEX ? base.name() : null;
+        DbObject exact = new DbObject(type, "EXACT", tableName);
+        DbObject ignoredNew = new DbObject(type, "SKIP_NEW", tableName);
+        DbObject ignoredOld = new DbObject(type, "SKIP_OLD", tableName);
+        DbObject ignoredChanged = new DbObject(type, "SKIP_CHANGED", tableName);
+        DbObject created = new DbObject(type, "INCLUDED_NEW", tableName);
+        DbObject removed = new DbObject(type, "INCLUDED_OLD", tableName);
+        DbObject changed = new DbObject(type, "INCLUDED_CHANGED", tableName);
+        FakeMetadata metadata = new FakeMetadata(snapshot(base, exact, ignoredNew, ignoredChanged, created, changed),
+                snapshot(base, ignoredOld, ignoredChanged, removed, changed));
+        String alteration = "ALTER " + type + " \"TARGET\".\"INCLUDED_CHANGED\" "
+                + (type == Type.SEQUENCE ? "CACHE 50" : "ADD LABEL VARCHAR2(40)");
+        metadata.change(changed, alteration);
+
+        String script = write(metadata, "exclusions-" + type + ".sql", List.of("eXaCt", "sKiP_*"));
+
+        for (DbObject excluded : List.of(exact, ignoredNew, ignoredOld, ignoredChanged)) {
+            assertFalse(script.contains(excluded.name()), excluded.name());
+            assertFalse(metadata.ddlRequests.contains(excluded), "Ausgeschlossene Objekte brauchen kein CREATE-DDL.");
+            assertFalse(metadata.sxmlRequests.contains(excluded), "Ausgeschlossene Objekte brauchen kein Vergleichs-SXML.");
+        }
+        assertTrue(script.contains("\"INCLUDED_NEW\""));
+        assertTrue(script.contains("DROP " + type + " \"TARGET\".\"INCLUDED_OLD\";"));
+        assertTrue(script.contains(type == Type.TABLE || type == Type.SEQUENCE ? alteration
+                : "CREATE " + (type == Type.VIEW ? "OR REPLACE VIEW" : "INDEX") + " \"TARGET\".\"INCLUDED_CHANGED\""));
+        assertTrue(metadata.ddlRequests.contains(created));
+        assertEquals(1, metadata.comparisons.stream()
+                .filter(comparison -> comparison.actual().equals("TARGET:" + type + ":INCLUDED_CHANGED")).count());
+    }
+
+    @Test
+    void excludedTableAlsoProtectsItsIndexesAndForeignKeysDuringOtherTableChanges() throws Exception {
+        DbObject archived = object(Type.TABLE, "ARCHIVE");
+        DbObject changing = object(Type.TABLE, "CHANGING");
+        DbObject parent = object(Type.TABLE, "SAFE_PARENT");
+        DbObject protectedIndex = new DbObject(Type.INDEX, "IX_ARCHIVE", archived.name());
+        ForeignKey protectedKey = new ForeignKey("FK_ARCHIVE_PARENT", archived.name(), TARGET, parent.name());
+        ForeignKey activeKey = new ForeignKey("FK_CHANGING_PARENT", changing.name(), TARGET, parent.name());
+        Snapshot actual = snapshot(List.of(protectedKey, activeKey), Map.of(), archived, changing, parent, protectedIndex);
+        Snapshot desired = snapshot(List.of(
+                new ForeignKey(protectedKey.name(), archived.name(), REFERENCE, parent.name()),
+                new ForeignKey(activeKey.name(), changing.name(), REFERENCE, parent.name())), Map.of(),
+                archived, changing, parent, protectedIndex);
+        FakeMetadata metadata = new FakeMetadata(desired, actual);
+        metadata.foreignKeyParents.put(protectedKey.name(), parent.name());
+        metadata.foreignKeyParents.put(activeKey.name(), parent.name());
+        metadata.change(changing, "ALTER TABLE \"TARGET\".\"CHANGING\" ADD LABEL VARCHAR2(40)");
+
+        String script = write(metadata, "excluded-table-dependencies.sql", List.of("archive"));
+
+        assertFalse(script.contains("ARCHIVE"));
+        assertFalse(metadata.sxmlRequests.contains(archived));
+        assertFalse(metadata.sxmlRequests.contains(protectedIndex));
+        assertFalse(metadata.foreignKeyRequests.stream().anyMatch(key -> key.name().equals(protectedKey.name())));
+        assertTrue(script.contains("DROP CONSTRAINT \"FK_CHANGING_PARENT\";"));
+        assertTrue(script.contains("ADD CONSTRAINT \"FK_CHANGING_PARENT\""));
+        assertEquals(Set.of(changing.name()), metadata.checkedTables);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void excludedIndependentIndexBlocksAlterOrDropOfItsTableAndPreservesTheFile(boolean removeTable) throws Exception {
+        DbObject table = object(Type.TABLE, "ITEMS");
+        DbObject index = new DbObject(Type.INDEX, "IX_PROTECTED", table.name());
+        FakeMetadata metadata = new FakeMetadata(removeTable ? snapshot() : snapshot(table, index), snapshot(table, index));
+        if (!removeTable) metadata.change(table, "ALTER TABLE \"TARGET\".\"ITEMS\" DROP COLUMN LABEL");
+        Path output = Files.writeString(directory.resolve("protected-index.sql"), "previous complete script");
+
+        SQLException failure = assertThrows(SQLException.class, () -> comparator.writeSynchronizationScript(
+                metadata, REFERENCE, TARGET, output, List.of("ix_protected")));
+
+        assertTrue(failure.getMessage().contains(index.name()));
+        assertTrue(failure.getMessage().contains(table.name()));
+        assertEquals("previous complete script", Files.readString(output));
+        assertFalse(metadata.sxmlRequests.contains(index));
+        assertFalse(metadata.ddlRequests.contains(index));
+        try (var files = Files.list(directory)) {
+            assertEquals(List.of(output), files.toList());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void excludedPrimaryKeyIndexBlocksChangesAndCreationThroughTableDdl(boolean newTable) throws Exception {
+        DbObject table = object(Type.TABLE, "ITEMS");
+        Snapshot keyedTable = new Snapshot(snapshot(table).objects(), List.of(), Map.of(), Map.of("PK_ITEMS", table.name()));
+        FakeMetadata metadata = new FakeMetadata(newTable ? keyedTable : snapshot(table), newTable ? snapshot() : keyedTable);
+        if (!newTable) metadata.change(table, "ALTER TABLE \"TARGET\".\"ITEMS\" DROP PRIMARY KEY");
+        Path output = Files.writeString(directory.resolve("protected-pk.sql"), "previous complete script");
+
+        SQLException failure = assertThrows(SQLException.class, () -> comparator.writeSynchronizationScript(
+                metadata, REFERENCE, TARGET, output, List.of("pk_*")));
+
+        assertTrue(failure.getMessage().contains("PK_ITEMS"));
+        assertTrue(failure.getMessage().contains(table.name()));
+        assertEquals("previous complete script", Files.readString(output));
+    }
+
+    @Test
+    void foreignKeyFromAnExcludedChildBlocksChangesToItsReferencedParent() throws Exception {
+        DbObject child = object(Type.TABLE, "KEEP_CHILD");
+        DbObject parent = object(Type.TABLE, "PARENT");
+        ForeignKey actualKey = new ForeignKey("FK_CHILD_PARENT", child.name(), TARGET, parent.name());
+        ForeignKey desiredKey = new ForeignKey(actualKey.name(), child.name(), REFERENCE, parent.name());
+        FakeMetadata metadata = new FakeMetadata(snapshot(List.of(desiredKey), Map.of(), child, parent),
+                snapshot(List.of(actualKey), Map.of(), child, parent));
+        metadata.change(parent, "ALTER TABLE \"TARGET\".\"PARENT\" DROP PRIMARY KEY");
+        Path output = Files.writeString(directory.resolve("protected-child.sql"), "previous complete script");
+
+        SQLException failure = assertThrows(SQLException.class, () -> comparator.writeSynchronizationScript(
+                metadata, REFERENCE, TARGET, output, List.of("keep_*")));
+
+        assertTrue(failure.getMessage().contains(actualKey.name()));
+        assertTrue(failure.getMessage().contains(parent.name()));
+        assertEquals("previous complete script", Files.readString(output));
+        assertTrue(metadata.foreignKeyRequests.isEmpty());
+    }
+
+    @Test
+    void foreignKeyCannotReferenceAnExcludedParentThatDoesNotExistInTheTarget() throws Exception {
+        DbObject child = object(Type.TABLE, "CHILD");
+        DbObject parent = object(Type.TABLE, "KEEP_PARENT");
+        ForeignKey key = new ForeignKey("FK_CHILD_PARENT", child.name(), REFERENCE, parent.name());
+        FakeMetadata metadata = new FakeMetadata(snapshot(List.of(key), Map.of(), child, parent), snapshot());
+        Path output = directory.resolve("not-created/protected-parent.sql");
+
+        SQLException failure = assertThrows(SQLException.class, () -> comparator.writeSynchronizationScript(
+                metadata, REFERENCE, TARGET, output, List.of("KEEP_PARENT")));
+
+        assertTrue(failure.getMessage().contains(key.name()));
+        assertTrue(failure.getMessage().contains(parent.name()));
+        assertFalse(Files.exists(output.getParent()));
+        assertFalse(metadata.ddlRequests.contains(parent));
+    }
+
+    @Test
+    void foreignKeyMayReferenceAnExcludedParentThatAlreadyExistsInTheTarget() throws Exception {
+        DbObject child = object(Type.TABLE, "CHILD");
+        DbObject parent = object(Type.TABLE, "KEEP_PARENT");
+        ForeignKey key = new ForeignKey("FK_CHILD_PARENT", child.name(), REFERENCE, parent.name());
+        FakeMetadata metadata = new FakeMetadata(snapshot(List.of(key), Map.of(), child, parent), snapshot(parent));
+        metadata.foreignKeyParents.put(key.name(), parent.name());
+
+        String script = write(metadata, "existing-excluded-parent.sql", List.of("KEEP_PARENT"));
+
+        assertTrue(script.contains("CREATE TABLE \"TARGET\".\"CHILD\""));
+        assertTrue(script.contains("REFERENCES \"TARGET\".\"KEEP_PARENT\""));
+        assertFalse(script.contains("CREATE TABLE \"TARGET\".\"KEEP_PARENT\""));
+        assertFalse(metadata.sxmlRequests.contains(parent));
+        assertEquals(List.of(child), metadata.ddlRequests);
+    }
+
+    @Test
+    void excludedViewsAreNeitherCompiledNorValidatedAndTheirCyclesAreIgnored() throws Exception {
+        DbObject table = object(Type.TABLE, "ITEMS");
+        DbObject protectedA = object(Type.VIEW, "KEEP_A");
+        DbObject protectedB = object(Type.VIEW, "KEEP_B");
+        DbObject protectedNew = object(Type.VIEW, "KEEP_NEW");
+        DbObject selected = object(Type.VIEW, "ITEMS_VIEW");
+        Map<String, Set<String>> cycles = Map.of("KEEP_A", Set.of("KEEP_B"), "KEEP_B", Set.of("KEEP_A"));
+        FakeMetadata metadata = new FakeMetadata(snapshot(List.of(), cycles, table, protectedA, protectedB, protectedNew, selected),
+                snapshot(List.of(), cycles, table, protectedA, protectedB, selected));
+        metadata.change(table, "ALTER TABLE \"TARGET\".\"ITEMS\" ADD LABEL VARCHAR2(40)");
+
+        String script = write(metadata, "excluded-views.sql", List.of("keep_*"));
+
+        assertFalse(script.contains("KEEP_"));
+        assertFalse(metadata.sxmlRequests.contains(protectedA));
+        assertFalse(metadata.sxmlRequests.contains(protectedB));
+        assertFalse(metadata.ddlRequests.contains(protectedNew));
+        assertTrue(script.contains("ALTER VIEW \"TARGET\".\"ITEMS_VIEW\" COMPILE;"));
+        assertTrue(script.contains("object_name IN ('ITEMS_VIEW')"));
+    }
+
+    @Test
+    void newTableCannotReuseAConstraintNameOwnedByAnExcludedTargetTable() throws Exception {
+        DbObject protectedTable = object(Type.TABLE, "KEEP_TABLE");
+        DbObject newTable = object(Type.TABLE, "NEW_TABLE");
+        Snapshot desired = new Snapshot(snapshot(newTable).objects(), List.of(), Map.of(), Map.of(),
+                Map.of("C_SHARED", newTable.name()));
+        Snapshot actual = new Snapshot(snapshot(protectedTable).objects(), List.of(), Map.of(), Map.of(),
+                Map.of("C_SHARED", protectedTable.name()));
+        FakeMetadata metadata = new FakeMetadata(desired, actual);
+        metadata.createDdls.put(newTable, "CREATE TABLE \"TARGET\".\"NEW_TABLE\" "
+                + "(ID NUMBER CONSTRAINT \"C_SHARED\" CHECK (ID > 0));");
+        Path output = Files.writeString(directory.resolve("constraint-collision.sql"), "previous complete script");
+
+        SQLException failure = assertThrows(SQLException.class, () -> comparator.writeSynchronizationScript(
+                metadata, REFERENCE, TARGET, output, List.of("KEEP_*")));
+
+        assertTrue(failure.getMessage().contains("C_SHARED"));
+        assertTrue(failure.getMessage().contains(protectedTable.name()));
+        assertEquals("previous complete script", Files.readString(output));
+    }
+
+    @Test
+    void foreignKeyOnlyChangeCannotReuseACheckConstraintNameOnAnExcludedTargetTable() throws Exception {
+        DbObject protectedTable = object(Type.TABLE, "KEEP_TABLE");
+        DbObject child = object(Type.TABLE, "CHILD");
+        DbObject parent = object(Type.TABLE, "PARENT");
+        ForeignKey key = new ForeignKey("C_SHARED", child.name(), REFERENCE, parent.name());
+        Snapshot desired = new Snapshot(snapshot(child, parent).objects(), List.of(key), Map.of(), Map.of(),
+                Map.of(key.name(), child.name()));
+        Snapshot actual = new Snapshot(snapshot(protectedTable, child, parent).objects(), List.of(), Map.of(), Map.of(),
+                Map.of(key.name(), protectedTable.name()));
+        FakeMetadata metadata = new FakeMetadata(desired, actual);
+        Path output = Files.writeString(directory.resolve("fk-constraint-collision.sql"), "previous complete script");
+
+        SQLException failure = assertThrows(SQLException.class, () -> comparator.writeSynchronizationScript(
+                metadata, REFERENCE, TARGET, output, List.of("KEEP_*")));
+
+        assertTrue(failure.getMessage().contains(key.name()));
+        assertTrue(failure.getMessage().contains(protectedTable.name()));
+        assertTrue(metadata.ddlRequests.isEmpty(), "Die Tabellen selbst bleiben bei einer reinen FK-Änderung unverändert.");
+        assertEquals("previous complete script", Files.readString(output));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void selectedViewMayDependOnAnExcludedViewOnlyIfThatViewExistsInTheTarget(boolean parentExists) throws Exception {
+        DbObject protectedView = object(Type.VIEW, "KEEP_VIEW");
+        DbObject selectedView = object(Type.VIEW, "SELECTED_VIEW");
+        FakeMetadata metadata = new FakeMetadata(snapshot(List.of(), Map.of(selectedView.name(), Set.of(protectedView.name())),
+                protectedView, selectedView), parentExists ? snapshot(protectedView) : snapshot());
+        metadata.createDdls.put(selectedView, "CREATE OR REPLACE VIEW \"TARGET\".\"SELECTED_VIEW\" "
+                + "AS SELECT ID FROM \"TARGET\".\"KEEP_VIEW\";");
+        Path output = directory.resolve("view-dependency.sql");
+
+        if (parentExists) {
+            String script = write(metadata, output.getFileName().toString(), List.of("KEEP_VIEW"));
+            assertTrue(script.contains("CREATE OR REPLACE VIEW \"TARGET\".\"SELECTED_VIEW\""));
+            assertTrue(script.contains("ALTER VIEW \"TARGET\".\"SELECTED_VIEW\" COMPILE;"));
+            assertFalse(script.contains("ALTER VIEW \"TARGET\".\"KEEP_VIEW\" COMPILE;"));
+            assertFalse(script.contains("CREATE OR REPLACE VIEW \"TARGET\".\"KEEP_VIEW\""));
+            assertTrue(script.contains("object_name IN ('SELECTED_VIEW')"));
+        } else {
+            SQLException failure = assertThrows(SQLException.class, () -> comparator.writeSynchronizationScript(
+                    metadata, REFERENCE, TARGET, output, List.of("KEEP_VIEW")));
+            assertTrue(failure.getMessage().contains(protectedView.name()));
+            assertTrue(failure.getMessage().contains(selectedView.name()));
+            assertFalse(Files.exists(output));
+        }
+        assertFalse(metadata.ddlRequests.contains(protectedView));
+        assertFalse(metadata.sxmlRequests.contains(protectedView));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"TABLE,false,false", "TABLE,false,true", "TABLE,true,false", "TABLE,true,true",
+            "VIEW,false,false", "VIEW,false,true", "VIEW,true,false", "VIEW,true,true"})
+    void protectsExcludedTargetViewsAgainstDirectAndIndirectBaseChanges(Type baseType, boolean modify,
+                                                                       boolean indirect) throws Exception {
+        DbObject base = object(baseType, "BASE_OBJECT");
+        DbObject protectedView = object(Type.VIEW, "KEEP_VIEW");
+        DbObject bridge = object(Type.VIEW, "BRIDGE_VIEW");
+        Map<String, Set<String>> dependencies = indirect
+                ? Map.of(protectedView.name(), Set.of(bridge.name()), bridge.name(), Set.of(base.name()))
+                : Map.of(protectedView.name(), Set.of(base.name()));
+        List<DbObject> actualObjects = new ArrayList<>(List.of(base, protectedView));
+        List<DbObject> desiredObjects = new ArrayList<>();
+        if (modify) desiredObjects.add(base);
+        if (indirect) {
+            actualObjects.add(bridge);
+            desiredObjects.add(bridge);
+        }
+        FakeMetadata metadata = new FakeMetadata(snapshot(List.of(), dependencies, desiredObjects.toArray(DbObject[]::new)),
+                snapshot(List.of(), dependencies, actualObjects.toArray(DbObject[]::new)));
+        if (modify) {
+            if (baseType == Type.TABLE) metadata.change(base, "ALTER TABLE \"TARGET\".\"BASE_OBJECT\" DROP COLUMN LABEL");
+            else metadata.alterXmlByActual.put(TARGET + ":" + base.type() + ":" + base.name(),
+                    unsupported("Changed view projection"));
+        }
+        Path output = Files.writeString(directory.resolve("protected-view.sql"), "previous complete script");
+
+        SQLException failure = assertThrows(SQLException.class, () -> comparator.writeSynchronizationScript(
+                metadata, REFERENCE, TARGET, output, List.of("keep_*")));
+
+        assertTrue(failure.getMessage().contains(protectedView.name()));
+        assertTrue(failure.getMessage().contains(base.name()));
+        assertEquals("previous complete script", Files.readString(output));
+        assertFalse(metadata.sxmlRequests.contains(protectedView));
+        assertFalse(metadata.ddlRequests.contains(protectedView));
+        try (var files = Files.list(directory)) {
+            assertEquals(List.of(output), files.toList());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void unchangedViewDependenciesAllowNoopAndUnrelatedChanges(boolean unrelatedChange) throws Exception {
+        DbObject base = object(Type.TABLE, "BASE_TABLE");
+        DbObject unrelated = object(Type.TABLE, "UNRELATED_TABLE");
+        DbObject protectedView = object(Type.VIEW, "KEEP_VIEW");
+        DbObject bridge = object(Type.VIEW, "BRIDGE_VIEW");
+        Snapshot actual = snapshot(List.of(), Map.of(protectedView.name(), Set.of(bridge.name()),
+                bridge.name(), Set.of(base.name())), base, protectedView, bridge, unrelated);
+        FakeMetadata metadata = new FakeMetadata(actual, actual);
+        if (unrelatedChange) metadata.change(unrelated, "ALTER TABLE \"TARGET\".\"UNRELATED_TABLE\" ADD LABEL VARCHAR2(40)");
+
+        String script = write(metadata, "unaffected-view.sql", List.of("keep_*"));
+
+        assertFalse(script.contains("KEEP_VIEW"));
+        if (unrelatedChange) assertTrue(script.contains("ALTER TABLE \"TARGET\".\"UNRELATED_TABLE\""));
+        else assertTrue(objectStatements(script).isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void selectedViewRequiresItsExcludedBaseTableInTheTarget(boolean parentExists) throws Exception {
+        DbObject base = object(Type.TABLE, "KEEP_TABLE");
+        DbObject view = object(Type.VIEW, "SELECTED_VIEW");
+        FakeMetadata metadata = new FakeMetadata(snapshot(List.of(), Map.of(view.name(), Set.of(base.name())), base, view),
+                parentExists ? snapshot(base) : snapshot());
+        metadata.createDdls.put(view, "CREATE OR REPLACE VIEW \"TARGET\".\"SELECTED_VIEW\" AS SELECT ID FROM \"TARGET\".\"KEEP_TABLE\";");
+        Path output = directory.resolve("excluded-base.sql");
+
+        if (parentExists) {
+            String script = write(metadata, output.getFileName().toString(), List.of("keep_*"));
+            assertTrue(script.contains("CREATE OR REPLACE VIEW \"TARGET\".\"SELECTED_VIEW\""));
+            assertFalse(script.contains("CREATE TABLE"));
+        } else {
+            SQLException failure = assertThrows(SQLException.class, () -> comparator.writeSynchronizationScript(
+                    metadata, REFERENCE, TARGET, output, List.of("keep_*")));
+            assertTrue(failure.getMessage().contains(view.name()));
+            assertTrue(failure.getMessage().contains(base.name()));
+            assertFalse(Files.exists(output));
+        }
+        assertFalse(metadata.sxmlRequests.contains(base));
+        assertFalse(metadata.ddlRequests.contains(base));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"TABLE,VIEW", "VIEW,TABLE"})
+    void excludedViewBaseMayHaveAnotherRelationTypeInTheTarget(Type desiredType, Type actualType) throws Exception {
+        DbObject desiredBase = object(desiredType, "KEEP_DATA");
+        DbObject actualBase = object(actualType, "KEEP_DATA");
+        DbObject view = object(Type.VIEW, "SELECTED_VIEW");
+        Map<String, Set<String>> dependencies = Map.of(view.name(), Set.of(desiredBase.name()));
+        FakeMetadata metadata = new FakeMetadata(snapshot(List.of(), dependencies, desiredBase, view),
+                snapshot(actualBase));
+        metadata.createDdls.put(view, "CREATE OR REPLACE VIEW \"TARGET\".\"SELECTED_VIEW\" AS SELECT ID FROM \"TARGET\".\"KEEP_DATA\";");
+
+        String script = write(metadata, "different-excluded-base-type.sql", List.of("keep_*"));
+
+        assertTrue(script.contains(metadata.createDdls.get(view)));
+        assertFalse(script.contains("CREATE TABLE"));
+        assertFalse(script.contains("DROP "));
+        assertEquals(List.of(view), metadata.ddlRequests);
+        assertTrue(metadata.sxmlRequests.isEmpty());
+    }
+
     private String write(FakeMetadata metadata, String fileName) throws Exception {
         Path output = directory.resolve(fileName);
         comparator.writeSynchronizationScript(metadata, REFERENCE, TARGET, output);
+        return Files.readString(output, WINDOWS_1252);
+    }
+
+    private String write(FakeMetadata metadata, String fileName, List<String> excludedObjects) throws Exception {
+        Path output = directory.resolve(fileName);
+        comparator.writeSynchronizationScript(metadata, REFERENCE, TARGET, output, excludedObjects);
         return Files.readString(output, WINDOWS_1252);
     }
 
@@ -562,7 +923,9 @@ class OracleSchemaComparatorTest {
         final Map<DbObject, String> createDdls = new LinkedHashMap<>();
         final Map<String, String> foreignKeyParents = new LinkedHashMap<>();
         final List<Comparison> comparisons = new ArrayList<>();
+        final List<DbObject> sxmlRequests = new ArrayList<>();
         final List<DbObject> ddlRequests = new ArrayList<>();
+        final List<ForeignKey> foreignKeyRequests = new ArrayList<>();
         Set<String> checkedTables;
         SQLException externalFailure;
         String conversionFailureSql;
@@ -598,6 +961,7 @@ class OracleSchemaComparatorTest {
         @Override
         public String sxml(String schema, String target, DbObject object) {
             assertEquals(TARGET, target, "Beide Metadatenstände müssen in das Zielschema remappt werden.");
+            sxmlRequests.add(object);
             return schema + ":" + object.type() + ":" + object.name();
         }
 
@@ -619,6 +983,7 @@ class OracleSchemaComparatorTest {
         @Override
         public String foreignKeyDdl(String schema, String target, ForeignKey key) {
             assertEquals(TARGET, target);
+            foreignKeyRequests.add(key);
             return "ALTER TABLE " + SqlText.qualified(target, key.tableName())
                     + " ADD CONSTRAINT " + SqlText.identifier(key.name()) + " FOREIGN KEY (ID) REFERENCES "
                     + SqlText.qualified(target, foreignKeyParents.getOrDefault(key.name(), "PARENT")) + " (ID);";

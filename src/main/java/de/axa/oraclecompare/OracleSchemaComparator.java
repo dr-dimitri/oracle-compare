@@ -29,9 +29,10 @@ import java.util.TreeMap;
  * Tabellen werden einschließlich ihrer Primär-/Unique-Schlüssel vor den Fremdschlüsseln
  * angelegt. Die separate Fremdschlüsselphase unterstützt auch zyklische und Selbstreferenzen.
  *
- * <p>Beide Schemata müssen in derselben Datenbank/PDB liegen. Die übergebene Verbindung
- * benötigt vollständigen Dictionary-/Metadatenzugriff (üblicherweise SELECT_CATALOG_ROLE).
- * Ihre Verwaltung und die Transaktionskontrolle bleiben vollständig beim Aufrufer.
+ * <p>Die Ein-Verbindungs-API vergleicht zwei Schemata derselben Datenbank/PDB. Die
+ * Zwei-Verbindungs-API unterstützt getrennte Datenbanken, auch mit identischen Schemanamen.
+ * Jede Verbindung benötigt vollständigen Dictionary-/Metadatenzugriff (üblicherweise
+ * SELECT_CATALOG_ROLE). Verwaltung und Transaktionskontrolle bleiben beim Aufrufer.
  * Während der Analyse dürfen die Schemata nicht parallel per DDL verändert werden.</p>
  *
  * <p>Die Instanz ist zustandslos. Eine Connection darf während eines Aufrufs nicht
@@ -56,20 +57,106 @@ public final class OracleSchemaComparator {
      */
     public void writeSynchronizationScript(Connection connection, String referenceSchema,
                                            String targetSchema, Path outputFile) throws SQLException, IOException {
+        writeSynchronizationScript(connection, referenceSchema, targetSchema, outputFile, List.of());
+    }
+
+    /**
+     * Schreibt einen Abgleich unter Ausschluss der angegebenen Objektnamen in beiden Schemata.
+     * Muster gelten für Tabellen, Indizes, Views und Sequenzen ohne Beachtung der Groß-/
+     * Kleinschreibung. {@code *} steht für beliebig viele Zeichen, {@code ?} für ein Zeichen;
+     * ein Backslash maskiert das folgende Zeichen. Alle anderen Zeichen sind wörtlich.
+     * Tabellen werden einschließlich ihrer Indizes und ausgehenden Fremdschlüssel ausgeschlossen.
+     * Ein Abhängigkeitskonflikt mit einem geschützten Objekt führt vor dem Schreiben zum Abbruch.
+     *
+     * @param connection offene Oracle-JDBC-Verbindung, deren Verwaltung beim Aufrufer bleibt
+     * @param referenceSchema gewünschter Stand, als exakter Dictionary-Name
+     * @param targetSchema zu änderndes Schema, als exakter Dictionary-Name
+     * @param outputFile SQL-Ausgabedatei in Windows-1252 mit CRLF-Zeilenumbrüchen
+     * @param excludedObjects Ausschlussmuster ohne Schema-/Typpräfix; leere Liste schließt nichts aus
+     * @throws SQLException bei Metadatenfehlern oder einem Konflikt mit ausgeschlossenen Objekten
+     * @throws IOException bei Schreib- oder Zeichenkodierungsfehlern
+     * @throws IllegalArgumentException bei ungültigen Schemanamen oder Ausschlussmustern
+     */
+    public void writeSynchronizationScript(Connection connection, String referenceSchema,
+                                           String targetSchema, Path outputFile, List<String> excludedObjects)
+            throws SQLException, IOException {
+        ExclusionFilter exclusions = new ExclusionFilter(excludedObjects);
         Objects.requireNonNull(connection, "connection");
         Objects.requireNonNull(outputFile, "outputFile");
         validateSchemas(referenceSchema, targetSchema);
         if (connection.isClosed()) throw new SQLException("Die JDBC-Connection ist geschlossen.");
-        writeSynchronizationScript(new OracleMetadata(connection), referenceSchema, targetSchema, outputFile);
+        Metadata metadata = new OracleMetadata(connection, exclusions);
+        writeSynchronizationScript(metadata, referenceSchema, metadata, targetSchema, outputFile, exclusions);
+    }
+
+    /** Vergleicht Schemata über getrennte Verbindungen, auch auf unterschiedlichen Oracle-Datenbanken. */
+    public void writeSynchronizationScript(Connection referenceConnection, String referenceSchema,
+                                           Connection targetConnection, String targetSchema, Path outputFile)
+            throws SQLException, IOException {
+        writeSynchronizationScript(referenceConnection, referenceSchema, targetConnection, targetSchema, outputFile, List.of());
+    }
+
+    /**
+     * Vergleicht zwei Datenbanken mit denselben Ausschlussregeln wie die Ein-Verbindungs-API.
+     * Referenzmetadaten werden ausschließlich über referenceConnection gelesen; Zielmetadaten,
+     * Differenzbildung und ALTERDDL-Konvertierung verwenden targetConnection. Beide Verbindungen
+     * bleiben offen und ihre Transaktionseinstellungen unverändert. Bei getrennten Verbindungen
+     * sind identische Schemanamen zulässig. Beide Datenbanken müssen Oracle 19c unterstützen.
+     *
+     * @param referenceConnection Verbindung zur Referenzdatenbank
+     * @param referenceSchema gewünschtes Schema als exakter Dictionary-Name
+     * @param targetConnection Verbindung zur Zieldatenbank
+     * @param targetSchema anzupassendes Schema als exakter Dictionary-Name
+     * @param outputFile SQL-Ausgabedatei in Windows-1252 mit CRLF
+     * @param excludedObjects Ausschlussmuster für beide Schemata
+     * @throws SQLException bei Verbindungs-, Metadaten- oder Abhängigkeitsfehlern
+     * @throws IOException bei Schreib- oder Zeichenkodierungsfehlern
+     * @throws IllegalArgumentException bei ungültigen Namen/Mustern oder identischem Schema derselben Verbindung
+     */
+    public void writeSynchronizationScript(Connection referenceConnection, String referenceSchema,
+                                           Connection targetConnection, String targetSchema, Path outputFile,
+                                           List<String> excludedObjects) throws SQLException, IOException {
+        ExclusionFilter exclusions = new ExclusionFilter(excludedObjects);
+        Objects.requireNonNull(referenceConnection, "referenceConnection");
+        Objects.requireNonNull(targetConnection, "targetConnection");
+        Objects.requireNonNull(outputFile, "outputFile");
+        SqlText.identifier(referenceSchema);
+        SqlText.identifier(targetSchema);
+        if (referenceConnection == targetConnection) validateSchemas(referenceSchema, targetSchema);
+        if (referenceConnection.isClosed() || targetConnection.isClosed()) throw new SQLException("Eine JDBC-Connection ist geschlossen.");
+        writeSynchronizationScript(new OracleMetadata(referenceConnection, exclusions), referenceSchema,
+                new OracleMetadata(targetConnection, exclusions), targetSchema, outputFile, exclusions);
     }
 
     /** Interner Einstieg für Tests ohne laufende Oracle-Instanz. */
     void writeSynchronizationScript(Metadata metadata, String referenceSchema,
                                     String targetSchema, Path outputFile) throws SQLException, IOException {
+        writeSynchronizationScript(metadata, referenceSchema, targetSchema, outputFile, List.of());
+    }
+
+    /** Testbarer Einstieg mit denselben Ausschlussregeln wie die öffentliche JDBC-API. */
+    void writeSynchronizationScript(Metadata metadata, String referenceSchema, String targetSchema,
+                                    Path outputFile, List<String> excludedObjects) throws SQLException, IOException {
         validateSchemas(referenceSchema, targetSchema);
-        String script = plan(metadata, referenceSchema, targetSchema);
+        writeSynchronizationScript(metadata, referenceSchema, metadata, targetSchema, outputFile, new ExclusionFilter(excludedObjects));
+    }
+
+    /** Testbarer Einstieg mit strikt getrennten Metadatenquellen. */
+    void writeSynchronizationScript(Metadata referenceMetadata, String referenceSchema, Metadata targetMetadata,
+                                    String targetSchema, Path outputFile, List<String> excludedObjects) throws SQLException, IOException {
+        writeSynchronizationScript(referenceMetadata, referenceSchema, targetMetadata, targetSchema,
+                outputFile, new ExclusionFilter(excludedObjects));
+    }
+
+    private void writeSynchronizationScript(Metadata referenceMetadata, String referenceSchema,
+                                            Metadata targetMetadata, String targetSchema,
+                                            Path outputFile, ExclusionFilter exclusions) throws SQLException, IOException {
+        SqlText.identifier(referenceSchema);
+        SqlText.identifier(targetSchema);
+        String script = plan(referenceMetadata, targetMetadata, referenceSchema, targetSchema, exclusions);
         Path output = outputFile.toAbsolutePath().normalize();
-        Files.createDirectories(output.getParent());
+        // Vorhandene Verzeichnislinks akzeptieren; createDirectories lehnt den Link selbst ab.
+        if (!Files.isDirectory(output.getParent())) Files.createDirectories(output.getParent());
         Path temporary = Files.createTempFile(output.getParent(), ".oracle-compare-", ".sql.tmp");
         try {
             Files.writeString(temporary, windowsLineEndings(script), OUTPUT_CHARSET);
@@ -89,9 +176,11 @@ public final class OracleSchemaComparator {
     }
 
     /** Plant zuerst alle Operationen; ein Fehler kann so keine halbe Abgleichsdatei hinterlassen. */
-    private String plan(Metadata metadata, String reference, String target) throws SQLException {
-        Snapshot desired = metadata.snapshot(reference);
-        Snapshot actual = metadata.snapshot(target);
+    private String plan(Metadata referenceMetadata, Metadata targetMetadata, String reference, String target,
+                        ExclusionFilter exclusions) throws SQLException {
+        ComparisonScope scope = new ComparisonScope(referenceMetadata.snapshot(reference), targetMetadata.snapshot(target), exclusions);
+        Snapshot desired = scope.desired();
+        Snapshot actual = scope.actual();
         List<String> dropIndexes = new ArrayList<>();
         List<String> sequences = new ArrayList<>();
         List<String> constraintDrops = new ArrayList<>();
@@ -110,25 +199,26 @@ public final class OracleSchemaComparator {
                 if (old != null && type == Type.INDEX && changedTables.contains(old.tableName())) {
                     // DROP COLUMN kann auch unveränderte Indexdefinitionen physisch entfernen.
                     dropIndexes.add(drop(target, old));
-                    ddl = metadata.ddl(reference, target, object);
+                    ddl = referenceMetadata.ddl(reference, target, object);
                 } else if (old == null) {
-                    ddl = metadata.ddl(reference, target, object);
+                    ddl = referenceMetadata.ddl(reference, target, object);
                     if (type == Type.INDEX && actual.constraintIndexes().containsKey(object.name())) {
                         releaseConstraintIndexes.add(dropIndexIfPresent(target, object.name()));
                     }
                 } else {
                     String alterXml;
                     try {
-                        alterXml = comparisonXml(metadata, type, metadata.sxml(target, target, old), metadata.sxml(reference, target, object));
+                        alterXml = comparisonXml(targetMetadata, type, targetMetadata.sxml(target, target, old),
+                                referenceMetadata.sxml(reference, target, object));
                         MetadataXml.Difference diff = MetadataXml.inspect(alterXml);
                         if (!diff.hasStatements() && diff.unsupportedReason() == null) continue;
                         if (type == Type.INDEX) {
                             // Eine geänderte Spaltenliste ist nicht per ALTER INDEX ausdrückbar.
                             dropIndexes.add(drop(target, old));
-                            ddl = metadata.ddl(reference, target, object);
+                            ddl = referenceMetadata.ddl(reference, target, object);
                         } else if (type == Type.VIEW) {
                             // CREATE OR REPLACE erhält die Grants einer bestehenden View.
-                            ddl = metadata.ddl(reference, target, object);
+                            ddl = referenceMetadata.ddl(reference, target, object);
                         } else {
                             if (diff.unsupportedReason() != null) {
                                 throw new SQLException("Oracle kann diese Änderung nicht per ALTER ausführen: " + diff.unsupportedReason());
@@ -136,13 +226,13 @@ public final class OracleSchemaComparator {
                             if (type == Type.TABLE) {
                                 var phases = MetadataXml.constraintPhases(alterXml);
                                 if (phases.constraintDropsXml() != null) {
-                                    constraintDrops.add(requireDdl(metadata.alterDdl(type, phases.constraintDropsXml()), object));
+                                    constraintDrops.add(requireDdl(targetMetadata.alterDdl(type, phases.constraintDropsXml()), object));
                                 }
                                 changedTables.add(object.name());
                                 if (phases.remainingXml() == null) continue;
-                                ddl = metadata.alterDdl(type, phases.remainingXml());
+                                ddl = targetMetadata.alterDdl(type, phases.remainingXml());
                             } else {
-                                ddl = metadata.alterDdl(type, alterXml);
+                                ddl = targetMetadata.alterDdl(type, alterXml);
                             }
                         }
                     } catch (SQLException e) {
@@ -159,10 +249,13 @@ public final class OracleSchemaComparator {
                 }
             }
         }
-        Map<String, String> actualKeys = foreignKeys(metadata, actual, target, target);
-        Map<String, String> desiredKeys = foreignKeys(metadata, desired, reference, target);
+        Set<String> changedViews = difference(actual.objects(Type.VIEW).keySet(), desired.objects(Type.VIEW).keySet());
+        changedViews.addAll(views.keySet());
+        scope.checkDependencies(changedTables, changedViews, reference, target);
+        Map<String, String> actualKeys = foreignKeys(targetMetadata, actual, target, target);
+        Map<String, String> desiredKeys = foreignKeys(referenceMetadata, desired, reference, target);
         boolean resetKeys = !changedTables.isEmpty() || !actualKeys.equals(desiredKeys);
-        metadata.checkExternalForeignKeys(target, changedTables);
+        targetMetadata.checkExternalForeignKeys(target, changedTables);
 
         List<String> commands = new ArrayList<>();
         if (resetKeys) {
@@ -203,7 +296,7 @@ public final class OracleSchemaComparator {
         if (changed) {
             // Auch zuvor unveränderte Views können durch Tabellen-DDL invalidiert werden.
             for (String name : viewOrder(desired)) commands.add("ALTER VIEW " + SqlText.qualified(target, name) + " COMPILE;");
-            if (!desired.objects(Type.VIEW).isEmpty()) commands.add(validateViews(target));
+            if (!desired.objects(Type.VIEW).isEmpty()) commands.add(validateViews(target, desired.objects(Type.VIEW).keySet()));
         }
         StringBuilder script = new StringBuilder("""
                 -- Oracle-Schemaabgleich (Oracle 19c; SQL*Plus / SQLcl)
@@ -293,19 +386,26 @@ public final class OracleSchemaComparator {
     }
 
     /** FORCE-Views können trotz SQL-Erfolg invalid sein; das Skript meldet dies explizit als Fehler. */
-    private static String validateViews(String target) {
+    private static String validateViews(String target, Set<String> selectedViews) {
+        // Oracle 19c erlaubt höchstens 1000 Ausdrücke pro IN-Liste. Nur ausgewählte Views prüfen.
+        List<String> names = new TreeSet<>(selectedViews).stream().map(name -> "'" + name.replace("'", "''") + "'").toList();
+        List<String> groups = new ArrayList<>();
+        for (int i = 0; i < names.size(); i += 1000) {
+            groups.add("object_name IN (" + String.join(", ", names.subList(i, Math.min(i + 1000, names.size()))) + ")");
+        }
         return """
                 DECLARE
                   invalid_count PLS_INTEGER;
                 BEGIN
                   SELECT COUNT(*) INTO invalid_count FROM all_objects
-                    WHERE owner = '%s' AND object_type = 'VIEW' AND status <> 'VALID';
+                    WHERE owner = '%s' AND object_type = 'VIEW' AND status <> 'VALID'
+                      AND (%s);
                   IF invalid_count > 0 THEN
                     RAISE_APPLICATION_ERROR(-20002, 'Schemaabgleich: Views sind ungueltig; ALL_ERRORS pruefen.');
                   END IF;
                 END;
                 /
-                """.formatted(target.replace("'", "''"));
+                """.formatted(target.replace("'", "''"), String.join(" OR ", groups));
     }
 
     private static void validateSchemas(String reference, String target) {

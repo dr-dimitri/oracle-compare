@@ -27,15 +27,91 @@ void schreibeAbgleich(Connection connection) throws Exception {
 
 Schemanamen sind exakte Dictionary-Namen ohne äußere Anführungszeichen. Für unquoted angelegte
 Schemata daher beispielsweise `REFERENZ`, für `CREATE USER "MeineApp" ...` dagegen `MeineApp`.
-Beide Schemata müssen in derselben Datenbank/PDB existieren und verschieden sein.
+Bei Verwendung einer Connection müssen beide Schemata in derselben Datenbank/PDB existieren
+und verschieden sein. Für getrennte Datenbanken können zwei Connections übergeben werden;
+dabei dürfen die Schemanamen identisch sein:
 
-Die Klasse schließt die übergebene Connection nicht, verändert weder Auto-Commit noch
+```java
+new OracleSchemaComparator().writeSynchronizationScript(
+    referenceConnection, referenceConnection.getSchema(),
+    targetConnection, targetConnection.getSchema(),
+    Path.of("abgleich.sql"), java.util.List.of("TMP_*")
+);
+```
+
+Die Referenz wird über die erste, das Ziel über die zweite Connection gelesen. Die
+XML-Differenzbildung und ALTER-DDL-Konvertierung erfolgen auf der Zieldatenbank.
+Die Überladung ist auch ohne abschließende Ausschlussliste verfügbar. Beide Datenbanken
+müssen die verwendeten Oracle-19c-Pakete und Metadatenformate unterstützen.
+
+Die Klasse schließt die übergebenen Connections nicht, verändert weder Auto-Commit noch
 Session-Transformparameter und ruft weder `commit()` noch `rollback()` auf. Während eines
 Aufrufs die Connection exklusiv verwenden und parallele DDL-Änderungen an den Schemata vermeiden.
 Statements, ResultSets, Metadaten-Handles und temporäre CLOBs werden wieder freigegeben.
 Eine vorhandene Ausgabedatei wird erst ersetzt, wenn die Planung und das Schreiben erfolgreich waren.
 Zeichen, die sich nicht in Windows-1252 darstellen lassen, führen zu einer `IOException`;
 eine vorhandene Ausgabedatei bleibt dabei erhalten.
+
+## Objekte ausschließen
+
+Die zusätzliche Überladung nimmt als letzten Parameter eine Liste von Objektnamen oder
+Ausschlussmustern entgegen. Die bisherige Signatur bleibt erhalten und schließt nichts aus.
+
+```java
+new OracleSchemaComparator().writeSynchronizationScript(
+    connection, "REFERENZ", "ZIEL", Path.of("abgleich.sql"),
+    java.util.List.of("AUDIT_LOG", "tmp_*", "*_BACKUP?")
+);
+```
+
+Die Muster gelten für vollständige Dictionary-Objektnamen in **beiden Schemata**, ohne
+Schema-/Typpräfix oder äußere Anführungszeichen. Groß-/Kleinschreibung wird ignoriert.
+Sobald ein Muster passt, wird das Objekt ausgeschlossen; die übrige Namensauflösung bleibt
+unverändert und verwendet weiterhin die exakten Oracle-Namen.
+
+| Muster | Bedeutung |
+| --- | --- |
+| `AUDIT_LOG` | Exakter Name, beispielsweise auch `Audit_Log` |
+| `TMP_*` | Namen mit Präfix `TMP_`; `*` steht für null oder mehr Zeichen |
+| `BACKUP_?` | `BACKUP_` gefolgt von genau einem Zeichen |
+| `REPORT\*` | Wörtlicher Name `REPORT*`; in einem Java-String `"REPORT\\*"` schreiben |
+
+`_`, `%`, Punkte und Regex-Sonderzeichen sind wörtlich. Ein Backslash maskiert das nächste
+Zeichen. `List.of()` schließt nichts aus; `List.of("*")` schließt alles aus. Null, leere Muster,
+Kontrollzeichen und ein abschließender unvollständiger Backslash führen zu einer
+`IllegalArgumentException`, bevor auf die Datenbank zugegriffen wird.
+
+Ausgeschlossene Tabellen, Indizes, Views und eigenständige Sequenzen erhalten kein
+CREATE-/ALTER-/DROP-/COMPILE-DDL. Ausgeschlossene Views sind auch von der abschließenden
+Gültigkeitsprüfung ausgenommen. Bei einem Tabellenausschluss werden ihre Indizes und
+ausgehenden Fremdschlüssel ebenfalls ausgeschlossen. Tabellengebundene Constraints und
+Identity-Sequenzen werden über die zugehörige Tabelle ausgewählt.
+
+Der Plan behält die notwendigen Schutzinformationen: Ein ausgeschlossener Index darf nicht
+durch ein Tabellen-ALTER oder DROP verschwinden. Ebenso bleiben Fremdschlüssel auf
+ausgeschlossenen Tabellen erhalten. Wenn eine geplante Tabellenänderung mit diesem Schutz
+kollidiert, entsteht eine `SQLException` mit Objektkontext; eine vorhandene Datei bleibt
+unverändert. Das gilt auch für ausgeschlossene PK-/UK-Indizes, die Oracle im Tabellen-DDL
+mitliefern würde. Ausgeschlossene Bitmap-Join-Indizes im Ziel verhindern konservativ jede
+Tabellenänderung, da ihre Dimensionstabellen ebenfalls betroffen sein können.
+
+Ausgeschlossene Ziel-Views schützen auch ihre direkt oder über weitere Views referenzierten
+Tabellen und Views vor Änderungen. Der Plan bricht bei einem geplanten DROP, Tabellen-ALTER
+oder View-Ersatz dieser Grundlagen ab, da die ausgeschlossene View dadurch ungültig werden
+könnte. Unbeteiligte Änderungen bleiben möglich. Berücksichtigt werden lokale Abhängigkeiten
+innerhalb des Zielschemas; Referenzen über Datenbanklinks werden nicht als lokale Objekte behandelt.
+
+Interne Speichertabellen eines ausgeschlossenen Domain-Index oder einer ausgeschlossenen
+Basistabelle werden über `DBA_SECONDARY_OBJECTS` zugeordnet und einschließlich ihrer Indizes
+und Constraints aus dem Abgleich genommen. Ihre generierten Namen müssen nicht zusätzlich
+als Ausschlussmuster angegeben werden. Belegte Constraint-Namen bleiben für die Prüfung
+auf Namenskonflikte sichtbar.
+
+Benötigt ein ausgewähltes Objekt eine ausgeschlossene Tabelle, View oder Sequenz, muss diese
+Abhängigkeit bereits passend im Ziel vorhanden sein. Fehlende ausgeschlossene FK-Elterntabellen
+und ausgeschlossene Tabellen-/View-Grundlagen ausgewählter Views werden bei der Planung
+gemeldet; die passenden referenzierten Schlüssel bleiben Voraussetzung.
+Dictionary-Zugriff bleibt auch für ausgeschlossene Objekte nötig, um Abhängigkeiten zu prüfen.
 
 ## Bauen und starten
 
@@ -54,6 +130,10 @@ java -cp "target/oracle-compare-1.0.0-SNAPSHOT.jar:/pfad/ojdbc11.jar" \
   'jdbc:oracle:thin:@//localhost:1521/ORCLPDB1' META_READER \
   REFERENZ ZIEL abgleich-ziel.sql
 ```
+
+Optional folgen nach dem Ausgabepfad die Ausschlussmuster, etwa
+`REFERENZ ZIEL abgleich-ziel.sql "AUDIT_LOG" "TMP_*" "*_BACKUP?"`.
+Muster in der Shell quotieren, damit sie unverändert beim Programm ankommen.
 
 Unter Windows trennt `;` die Classpath-Einträge. Das erzeugte Skript mit SQL*Plus oder SQLcl
 als Zielschema-Eigentümer bzw. ausreichend berechtigter Benutzer ausführen:
@@ -118,7 +198,7 @@ Index berücksichtigt, dass Oracle den alten Index beim Constraint-Drop behalten
 - Materialized Views und deren Storage-/Logtabellen, Grants, Kommentare, Trigger, Packages, Types und
   Synonyme werden nicht abgeglichen. Von den ausgewählten Objekten benötigte Types, Funktionen,
   Tablespaces und andere externe Ressourcen müssen im Ziel bereits vorhanden sein.
-  Cluster-/Domain-Objekte, Reference-Partitionierung und Bitmap-Join-Indizes führen vor der
+  Nicht ausgeschlossene Cluster-/Domain-Objekte, Reference-Partitionierung und Bitmap-Join-Indizes führen vor der
   Skripterzeugung zu einem expliziten Abbruch. Bei Bitmap-Join-Indizes sind Tabellenabhängigkeiten
   jenseits der Fakttabelle relevant; eine automatische Migration wird deshalb nicht angeboten.
 - Eingehende Fremdschlüssel aus nicht verwalteten Tabellen dürfen geänderte Zieltabellen nicht
@@ -143,21 +223,65 @@ DB-Link-Referenzen, Quotes, Kommentare und Literale. JDBC-Testdoubles prüfen de
 von Materialized-View-Logs, den frühzeitigen Abbruch bei Bitmap-Join-Indizes und die Einstellungen
 für den getrennten Tabellen-/Fremdschlüsselexport. Reihenfolgetests decken mehrstufige
 Foreign-Key-Abhängigkeiten, Selbstreferenzen, Zyklen und die vorherige PK-/UK-Anlage ab.
+Filtertests prüfen exakte Namen, Joker, Maskierung, Unicode und schreibungsunabhängige Vergleiche
+sowie Ausschlüsse für alle vier Objekttypen und den Schutz abhängiger Indizes/Fremdschlüssel.
 
-Ein tatsächlicher Oracle-19c-Integrationstest erfordert eine bereitgestellte Datenbank und wurde
-in der Entwicklungsumgebung nicht ausgeführt. Dafür liegt `tests/oracle/fixture.sql` bei:
+## Integrationstest mit zwei Datenbanken
 
-1. Zwei leere, ausschließlich für diesen Test verwendete Schemata `ORACMP_REF` und `ORACMP_TARGET`
-   bereitstellen; für Testobjekte passende CREATE-Rechte und Tablespace-Quota vergeben.
-2. Das Fixture als berechtigter Testbenutzer ausführen. Es legt bewusst unterschiedliche Tabellen,
-   Indizes, Views, Sequenzen und Fremdschlüssel in diesen beiden Schemata an. Der Check-Constraint
-   `CK_MOVED` wechselt dabei von `MOVE_B` nach `MOVE_A`, während beide Tabellen geändert werden.
-   Neue Tabellen bilden außerdem die Referenzkette `A_FK_LEAF` → `M_FK_MIDDLE` → `Z_FK_ROOT`,
-   eine Selbstreferenz und den Zyklus `X_FK_CYCLE` ↔ `Y_FK_CYCLE` ab.
-3. Das Programm mit Referenz `ORACMP_REF` und Ziel `ORACMP_TARGET` starten und das erzeugte Skript
-   mit SQL*Plus/SQLcl ausführen.
-4. Erneut generieren: Die Datei muss `Keine Unterschiede gefunden` enthalten. Außerdem prüfen,
-   dass alle Ziel-Views gültig sind und keine überzähligen `EXTRA_*`-Objekte übrig bleiben.
+`OracleSchemaIntegration` ist ein explizit aufrufbarer Test im Test-Classpath. Er nimmt beide
+JDBC-Connections von außen entgegen und öffnet oder schließt selbst keine Verbindung:
+
+```java
+import de.axa.oraclecompare.OracleSchemaIntegration;
+
+// Beide Connections werden von der eigenen Testumgebung bereitgestellt.
+OracleSchemaIntegration.Result result = OracleSchemaIntegration.run(
+    referenceConnection, targetConnection, Path.of("target", "integration-sync.sql")
+);
+System.out.println(result.synchronizationScript());
+System.out.println(result.externalDataFile());
+```
+
+Die Schemanamen stammen jeweils aus `Connection.getSchema()`. Die Verbindungen können auf
+verschiedene Datenbanken/PDBs zeigen; gleiche Schemanamen auf getrennten Datenbanken sind
+erlaubt. Es sind keine Schemabezeichnungen im Test festgeschrieben. Die beiden Fixtures liegen
+getrennt in `tests/oracle/reference.sql` und `tests/oracle/target.sql`. Ihre Platzhalter werden
+vom Java-Test ersetzt; die Ressourcen werden durch Maven nach `target/test-classes/oracle`
+kopiert. Die Dateien sind daher für den Aufruf durch den Test vorgesehen.
+
+Voraussetzungen für beide Datenbankzugänge:
+
+- Leere, ausschließlich für diesen Test bestimmte Schemata und eigene JDBC-Verbindungen ohne
+  offene Anwendungstransaktionen. Der Test prüft beide Schemata vor dem Aufbau.
+- Oracle 19c mit Partitionierungsunterstützung, den oben beschriebenen Metadatenrechten und
+  CREATE-Rechten für Tabellen, Indizes, Views und Sequenzen sowie passenden Tablespace-Quotas.
+  Die von Referenzobjekten verwendeten Tablespaces müssen auch im Ziel verfügbar sein;
+  Tablespace- und Storage-Angaben gehören weiterhin zum Vergleich.
+- Das bereits eingerichtete Oracle-Directory `EXPORT_HOST` mit READ-/WRITE-Rechten und
+  Zugriff auf `UTL_FILE.FGETATTR`. Ein Directory wird vom Test nicht angelegt.
+
+Der Test baut die Referenz über die erste Connection und den abweichenden Zielbestand über
+die zweite Connection auf. Er erzeugt dann das Abgleichsskript, führt es auf dem Ziel aus und
+verlangt bei einem zweiten Vergleich, dass keine weitere Objekt-DDL entsteht. Zusätzlich
+prüft er reale FK-/View-Zustände, Tabellenpartitionen und lokale/globale Indexpartitionen.
+
+Das Fixture umfasst normale Tabellen, Indizes, Views und Sequenzen, den Constraint-Wechsel
+`CK_MOVED` zwischen Tabellen, FK-Ketten, Selbstreferenzen und einen FK-Zyklus. Hinzu kommen
+RANGE- und LIST-partitionierte Tabellen, lokale Indizes sowie ein global RANGE-partitionierter
+Index. Die Partitionierungsfälle prüfen die vollständige Neuanlage auf dem Ziel; eine Änderung
+der Partitionierungsstrategie bestehender Tabellen ist nicht Bestandteil dieses Tests.
+
+Für externe Tabellen verwendet der Test `ORACLE_DATAPUMP` und `EXPORT_HOST`. Eine eindeutig
+benannte Dumpdatei mit kleinen Testdaten wird auf der Referenz erzeugt und bei Bedarf über die
+Zielverbindung ebenfalls angelegt. Bei einem gemeinsam verwendeten Verzeichnis wird die
+vorhandene Datei genutzt. Beide Definitionen verwenden denselben Dateinamen; nach dem Abgleich
+prüft der Test auch den tatsächlichen Lesezugriff auf die externe Zieltabelle.
+
+Der Test verändert keine Autocommit-/Isolationseinstellungen. Seine DDL führt trotzdem die
+Oracle-üblichen impliziten Commits aus. Testobjekte und die im Ergebnis genannte Dumpdatei
+bleiben zur Untersuchung erhalten, auch bei einem Fehler, und müssen anschließend in der
+Testumgebung aufgeräumt werden. `mvn test` startet diesen Datenbanktest nicht automatisch.
+Ein Lauf gegen echte Oracle-Datenbanken wurde in der Entwicklungsumgebung nicht ausgeführt.
 
 API-Grundlagen: [DBMS_METADATA (Oracle 19c)](https://docs.oracle.com/en/database/oracle/oracle-database/19/arpls/DBMS_METADATA.html),
 [DBMS_METADATA_DIFF (Oracle 19c)](https://docs.oracle.com/en/database/oracle/oracle-database/19/arpls/DBMS_METADATA_DIFF.html)

@@ -15,13 +15,25 @@ final class SchemaModel {
     record DbObject(Type type, String name, String tableName) { }
 
     /** Fremdschlüssel werden getrennt von Tabellen angelegt, um Zyklen aufzulösen. */
-    record ForeignKey(String name, String tableName) { }
+    record ForeignKey(String name, String tableName, String referencedOwner, String referencedTableName) {
+        ForeignKey(String name, String tableName) { this(name, tableName, null, null); }
+    }
 
+    /**
+     * viewDependencies enthält lokale Tabellen- und View-Referenzen der Views dieses Schemas.
+     * Tabellen und Views teilen sich in Oracle einen Namensraum; daher sind Namen als Knoten
+     * eindeutig. constraintTables enthält benannte Constraints für schemaweite Namenskonflikte.
+     */
     record Snapshot(Map<Type, Map<String, DbObject>> objects, List<ForeignKey> foreignKeys,
-                    Map<String, Set<String>> viewDependencies, Map<String, String> constraintIndexes) {
+                    Map<String, Set<String>> viewDependencies, Map<String, String> constraintIndexes,
+                    Map<String, String> constraintTables) {
         Snapshot(Map<Type, Map<String, DbObject>> objects, List<ForeignKey> foreignKeys,
                  Map<String, Set<String>> viewDependencies) {
             this(objects, foreignKeys, viewDependencies, Map.of());
+        }
+        Snapshot(Map<Type, Map<String, DbObject>> objects, List<ForeignKey> foreignKeys,
+                 Map<String, Set<String>> viewDependencies, Map<String, String> constraintIndexes) {
+            this(objects, foreignKeys, viewDependencies, constraintIndexes, Map.of());
         }
         Map<String, DbObject> objects(Type type) { return objects.getOrDefault(type, Map.of()); }
     }

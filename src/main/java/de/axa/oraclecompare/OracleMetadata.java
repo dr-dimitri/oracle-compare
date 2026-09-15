@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 
 /**
  * Kapselt Dictionary-Abfragen und die Oracle-Pakete. Alle Transform-Einstellungen sind
@@ -26,9 +27,17 @@ import java.util.TreeMap;
  */
 final class OracleMetadata implements Metadata {
     private final Connection connection;
+    private final ExclusionFilter exclusions;
     private final Map<String, Set<String>> managedTables = new HashMap<>();
+    private final Map<String, Set<String>> excludedBitmapJoinIndexes = new HashMap<>();
 
-    OracleMetadata(Connection connection) { this.connection = connection; }
+    OracleMetadata(Connection connection) { this(connection, ExclusionFilter.none()); }
+
+    /** Fachliche Objekte bleiben vollständig; interne Speichertabellen ausgeschlossener Indizes entfallen. */
+    OracleMetadata(Connection connection, ExclusionFilter exclusions) {
+        this.connection = connection;
+        this.exclusions = exclusions;
+    }
 
     /** DBA-Sichten vermeiden einen scheinbar vollständigen Abgleich mit eingeschränkten ALL-Sichten. */
     @Override
@@ -41,7 +50,9 @@ final class OracleMetadata implements Metadata {
         }
         Map<Type, Map<String, DbObject>> objects = new EnumMap<>(Type.class);
         for (Type type : Type.values()) objects.put(type, new TreeMap<>());
+        Set<String> protectedJoinIndexes = new TreeSet<>();
         Set<String> materializedViewLogs = materializedViewLogTables(schema);
+        Set<String> excludedSecondaryTables = excludedDomainIndexTables(schema);
         // Storage-Tabellen (Nested Tables, IOT-Overflow, MViews samt Logs) gehören zu ihren Basisobjekten.
         try (PreparedStatement statement = connection.prepareStatement("""
                 SELECT table_name, cluster_name, secondary,
@@ -56,8 +67,9 @@ final class OracleMetadata implements Metadata {
             try (ResultSet rows = statement.executeQuery()) {
                 while (rows.next()) {
                     String name = rows.getString(1);
-                    if (materializedViewLogs.contains(name)) continue;
-                    if (rows.getString(2) != null || "Y".equals(rows.getString(3)) || "REFERENCE".equals(rows.getString(4))) {
+                    if (materializedViewLogs.contains(name) || excludedSecondaryTables.contains(name)) continue;
+                    if (!exclusions.excludes(name) && (rows.getString(2) != null
+                            || "Y".equals(rows.getString(3)) || "REFERENCE".equals(rows.getString(4)))) {
                         throw new SQLException("Cluster-/Domain-/Reference-Partition-Tabelle benötigt einen eigenen Migrationsplan: " + schema + "." + name);
                     }
                     objects.get(Type.TABLE).put(name, new DbObject(Type.TABLE, name, null));
@@ -76,14 +88,21 @@ final class OracleMetadata implements Metadata {
                 while (rows.next()) {
                     String name = rows.getString(1);
                     String table = rows.getString(2);
-                    if (!schema.equals(rows.getString(4))) {
+                    if (schema.equals(rows.getString(4)) && excludedSecondaryTables.contains(table)) continue;
+                    boolean excluded = exclusions.excludes(name) || exclusions.excludes(table);
+                    if (!excluded && !schema.equals(rows.getString(4))) {
                         throw new SQLException("Schemaübergreifender Index wird nicht unterstützt: " + schema + "." + name);
                     }
                     if ("YES".equals(rows.getString(5))) {
-                        throw new SQLException("Bitmap-Join-Index benötigt einen eigenen Migrationsplan: " + schema + "." + name);
+                        if (!excluded) {
+                            throw new SQLException("Bitmap-Join-Index benötigt einen eigenen Migrationsplan: " + schema + "." + name);
+                        }
+                        // Die Faktentabelle allein beschreibt nicht alle beteiligten Dimensionstabellen.
+                        // Deshalb auch dann merken, wenn die Faktentabelle nicht verwaltet wird.
+                        protectedJoinIndexes.add(name);
                     }
                     if (!objects.get(Type.TABLE).containsKey(table)) continue;
-                    if (rows.getString(3).startsWith("DOMAIN")) {
+                    if (!excluded && rows.getString(3).startsWith("DOMAIN")) {
                         throw new SQLException("Domain-Index benötigt einen eigenen Migrationsplan: " + schema + "." + name);
                     }
                     objects.get(Type.INDEX).put(name, new DbObject(Type.INDEX, name, table));
@@ -99,20 +118,26 @@ final class OracleMetadata implements Metadata {
                 """, Type.SEQUENCE, objects);
         List<ForeignKey> keys = new ArrayList<>();
         try (PreparedStatement statement = connection.prepareStatement("""
-                SELECT constraint_name, table_name FROM dba_constraints
+                SELECT constraint_name, table_name, r_owner,
+                  (SELECT p.table_name FROM dba_constraints p
+                   WHERE p.owner=f.r_owner AND p.constraint_name=f.r_constraint_name)
+                FROM dba_constraints f
                 WHERE owner = ? AND constraint_type = 'R' ORDER BY constraint_name
                 """)) {
             statement.setString(1, schema);
             try (ResultSet rows = statement.executeQuery()) {
                 while (rows.next()) {
-                    if (objects.get(Type.TABLE).containsKey(rows.getString(2))) keys.add(new ForeignKey(rows.getString(1), rows.getString(2)));
+                    if (objects.get(Type.TABLE).containsKey(rows.getString(2))) {
+                        keys.add(new ForeignKey(rows.getString(1), rows.getString(2), rows.getString(3), rows.getString(4)));
+                    }
                 }
             }
         }
         Map<String, Set<String>> dependencies = new HashMap<>();
         try (PreparedStatement statement = connection.prepareStatement("""
                 SELECT name, referenced_name FROM dba_dependencies
-                WHERE owner = ? AND type = 'VIEW' AND referenced_owner = ? AND referenced_type = 'VIEW'
+                WHERE owner = ? AND type = 'VIEW' AND referenced_owner = ?
+                  AND referenced_type IN ('VIEW', 'TABLE') AND referenced_link_name IS NULL
                 """)) {
             statement.setString(1, schema);
             statement.setString(2, schema);
@@ -133,8 +158,25 @@ final class OracleMetadata implements Metadata {
                 }
             }
         }
-        managedTables.put(schema, Set.copyOf(objects.get(Type.TABLE).keySet()));
-        return new Snapshot(objects, List.copyOf(keys), dependencies, constraintIndexes);
+        // Explizite Namen sind schemaweit eindeutig. Ausschlüsse dürfen belegte Namen
+        // nicht unsichtbar machen; Oracle-generierte Namen werden beim Anlegen neu vergeben.
+        Map<String, String> constraintTables = new TreeMap<>();
+        try (PreparedStatement statement = connection.prepareStatement("""
+                SELECT c.constraint_name, c.table_name FROM dba_constraints c
+                WHERE c.owner = ? AND c.generated = 'USER NAME' ORDER BY c.constraint_name
+                """)) {
+            statement.setString(1, schema);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) constraintTables.put(rows.getString(1), rows.getString(2));
+            }
+        }
+        Set<String> selectedTables = new HashSet<>();
+        for (String name : objects.get(Type.TABLE).keySet()) {
+            if (!exclusions.excludes(name)) selectedTables.add(name);
+        }
+        managedTables.put(schema, Set.copyOf(selectedTables));
+        excludedBitmapJoinIndexes.put(schema, Set.copyOf(protectedJoinIndexes));
+        return new Snapshot(objects, List.copyOf(keys), dependencies, constraintIndexes, constraintTables);
     }
 
     /**
@@ -149,6 +191,33 @@ final class OracleMetadata implements Metadata {
             statement.setString(1, schema);
             try (ResultSet rows = statement.executeQuery()) {
                 while (rows.next()) tables.add(rows.getString(1));
+            }
+        }
+        return tables;
+    }
+
+    /**
+     * Übernimmt den Ausschluss eines Domain-Index oder seiner Basistabelle für dessen
+     * interne Tabellen. Die Zuordnung stammt aus dem Dictionary; generierte Namen und
+     * Namenspräfixe sind nicht zuverlässig. Gefiltert wird nach dem Besitzer der
+     * Speichertabelle, der vom Besitzer des Domain-Index abweichen kann.
+     * Ein alleiniger Ausschluss einer Speichertabelle schließt den Domain-Index nicht aus.
+     */
+    private Set<String> excludedDomainIndexTables(String schema) throws SQLException {
+        Set<String> tables = new HashSet<>();
+        try (PreparedStatement statement = connection.prepareStatement("""
+                SELECT s.secondary_object_name, s.index_name, i.table_name
+                FROM dba_secondary_objects s
+                JOIN dba_indexes i ON i.owner=s.index_owner AND i.index_name=s.index_name
+                WHERE s.secondary_object_owner = ?
+                """)) {
+            statement.setString(1, schema);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    if (exclusions.excludes(rows.getString(2)) || exclusions.excludes(rows.getString(3))) {
+                        tables.add(rows.getString(1));
+                    }
+                }
             }
         }
         return tables;
@@ -358,10 +427,16 @@ final class OracleMetadata implements Metadata {
         }
     }
 
-    /** Fremde Schemata werden nicht verändert; deren eingehende FKs würden Tabellen-DDL blockieren. */
+    /** Schützt fremde/ausgeschlossene Tabellen sowie ausgeschlossene Bitmap-Join-Indizes vor Tabellen-DDL. */
     @Override
     public void checkExternalForeignKeys(String target, Set<String> changedTables) throws SQLException {
         if (changedTables.isEmpty()) return;
+        Set<String> protectedIndexes = excludedBitmapJoinIndexes.getOrDefault(target, Set.of());
+        if (!protectedIndexes.isEmpty()) {
+            throw new SQLException("Ausgeschlossener Bitmap-Join-Index " + target + "."
+                    + new TreeSet<>(protectedIndexes).first()
+                    + " verhindert Tabellenänderungen: Seine Dimensionstabellen benötigen einen eigenen Migrationsplan.");
+        }
         try (PreparedStatement statement = connection.prepareStatement("""
                 SELECT fk.owner, fk.constraint_name, pk.table_name, fk.table_name
                 FROM dba_constraints fk JOIN dba_constraints pk
