@@ -19,7 +19,7 @@ final class SqlText {
     }
 
     /**
-     * Remappt qualifizierte Schema-Bezeichner in eingebettetem SQL, das MODIFY nicht umschreibt.
+     * Remappt qualifizierte Schema-Bezeichner in Defaults, View-Texten und Indexausdrücken.
      * Einfache, nationale und q-quotierte Literale sowie beide Kommentarformen bleiben erhalten.
      * Datenbank-Link-Namen und die über einen Link referenzierten entfernten Schemata bleiben
      * unverändert: Das Remapping gilt ausschließlich für Objekte in der lokalen Datenbank.

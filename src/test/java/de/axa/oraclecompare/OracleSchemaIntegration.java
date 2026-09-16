@@ -28,7 +28,7 @@ import java.util.UUID;
  * Testschema verwenden. Angelegte Testobjekte bleiben zur Untersuchung erhalten, auch im
  * Fehlerfall. Es werden keine Schemata/Benutzer/Directories erstellt oder gelöscht.</p>
  *
- * <p>Voraussetzungen: Metadaten-/DDL-Rechte des Comparators, Partitionierungsunterstützung,
+ * <p>Voraussetzungen: Dictionary-/DDL-Rechte des Comparators, Partitionierungsunterstützung,
  * verfügbare Quell-Tablespaces auch auf dem Ziel, READ/WRITE auf EXPORT_HOST sowie EXECUTE
  * auf UTL_FILE. Der Test erzeugt pro Lauf eine eigene Data-Pump-Datei in EXPORT_HOST auf
  * beiden Datenbanken (bei gemeinsamem Verzeichnis nur einmal). Der Dateiname wird zurückgegeben;
@@ -86,9 +86,8 @@ public final class OracleSchemaIntegration {
         OracleSqlScript.execute(referenceConnection, referenceFixture);
         OracleSqlScript.execute(targetConnection, targetFixture);
 
-        OracleSchemaComparator comparator = new OracleSchemaComparator();
-        comparator.writeSynchronizationScript(referenceConnection, referenceSchema,
-                targetConnection, targetSchema, outputFile);
+        OracleSchemaCompare comparator = comparator(referenceSchema, targetSchema, outputFile);
+        comparator.writeSynchronizationScript(referenceConnection, targetConnection);
         List<String> synchronization = OracleSqlScript.statements(Files.readString(outputFile, SCRIPT_CHARSET));
         if (objectStatements(synchronization, targetSchema).isEmpty()) {
             throw new SQLException("Das unterschiedliche Fixture erzeugte keine Objekt-DDL.");
@@ -98,8 +97,8 @@ public final class OracleSchemaIntegration {
 
         Path verification = Files.createTempFile(outputFile.toAbsolutePath().getParent(), ".oracle-compare-verification-", ".sql");
         try {
-            comparator.writeSynchronizationScript(referenceConnection, referenceSchema,
-                    targetConnection, targetSchema, verification);
+            comparator(referenceSchema, targetSchema, verification)
+                    .writeSynchronizationScript(referenceConnection, targetConnection);
             List<String> remaining = objectStatements(
                     OracleSqlScript.statements(Files.readString(verification, SCRIPT_CHARSET)), targetSchema);
             if (!remaining.isEmpty()) {
@@ -110,6 +109,14 @@ public final class OracleSchemaIntegration {
             Files.deleteIfExists(verification);
         }
         return new Result(outputFile.toAbsolutePath().normalize(), externalFile);
+    }
+
+    /**
+     * Isoliert die Konfiguration dieses expliziten Tests von der produktiven Properties-Datei.
+     * Der Comparator liest beide Datenbanken weiterhin ausschließlich über die übergebenen Connections.
+     */
+    private static OracleSchemaCompare comparator(String referenceSchema, String targetSchema, Path outputFile) {
+        return new OracleSchemaCompare(new CompareConfiguration(referenceSchema, targetSchema, outputFile, List.of()));
     }
 
     /** Keine Normalisierung: Auch gequotete Oracle-Schemanamen mit gemischter Schreibweise gelten. */
@@ -203,7 +210,7 @@ public final class OracleSchemaIntegration {
         return statements.stream().filter(sql -> !sql.equals(expectedSession)).toList();
     }
 
-    /** Prüft reale Dictionary-Zustände zusätzlich zum zweiten Metadatenabgleich. */
+    /** Prüft reale Dictionary-Zustände zusätzlich zum zweiten Abgleich der Anwendungsobjekte. */
     private static void verifyTarget(Connection connection, String schema) throws SQLException {
         requireNoRows(connection, schema, """
                 SELECT constraint_name, status || '/' || validated FROM all_constraints
