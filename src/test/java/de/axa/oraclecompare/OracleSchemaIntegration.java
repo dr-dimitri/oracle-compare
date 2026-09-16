@@ -107,6 +107,7 @@ public final class OracleSchemaIntegration {
             }
         } finally {
             Files.deleteIfExists(verification);
+            Files.deleteIfExists(CompareConfiguration.defaultReportFile(verification));
         }
         return new Result(outputFile.toAbsolutePath().normalize(), externalFile);
     }

@@ -39,6 +39,10 @@ class OracleSchemaCompareTest {
         assertFalse(target.boundSchemas.isEmpty());
         assertTrue(Files.readString(output, Charset.forName("windows-1252"))
                 .contains("ALTER SESSION SET CURRENT_SCHEMA = \"TARGET\";"));
+        String report = Files.readString(CompareConfiguration.defaultReportFile(output));
+        assertTrue(report.contains("Keine Unterschiede im berücksichtigten Objektumfang"));
+        assertTrue(report.contains("Referenzschema | <code>SOURCE</code>"));
+        assertTrue(report.contains("Zielschema | <code>TARGET</code>"));
         reference.assertReleased();
         target.assertReleased();
     }
@@ -77,12 +81,14 @@ class OracleSchemaCompareTest {
         Dictionary target = new Dictionary();
         target.failure = new SQLException("Missing dictionary privilege", "42000", 942);
         Path output = Files.writeString(directory.resolve("sync.sql"), "previous complete script");
+        Path report = Files.writeString(CompareConfiguration.defaultReportFile(output), "previous complete report");
 
         SQLException failure = assertThrows(SQLException.class, () -> comparator("SOURCE", "TARGET", output)
                 .writeSynchronizationScript(reference.connection, target.connection));
 
         assertEquals(942, failure.getErrorCode());
         assertEquals("previous complete script", Files.readString(output));
+        assertEquals("previous complete report", Files.readString(report));
         reference.assertReleased();
         target.assertReleased();
     }
@@ -96,6 +102,31 @@ class OracleSchemaCompareTest {
                 .writeSynchronizationScript(reference.connection, target.connection));
         assertTrue(reference.boundSchemas.isEmpty());
         assertTrue(target.boundSchemas.isEmpty());
+    }
+
+    @Test
+    void writesReportToConfiguredIndependentDirectory() throws Exception {
+        Dictionary reference = new Dictionary();
+        Dictionary target = new Dictionary();
+        Path output = directory.resolve("sql/sync.sql");
+        Path report = directory.resolve("reports/changes.md");
+        new OracleSchemaCompare(new CompareConfiguration("SOURCE", "TARGET", output, report, List.of()))
+                .writeSynchronizationScript(reference.connection, target.connection);
+        assertTrue(Files.isRegularFile(output));
+        assertTrue(Files.readString(report).contains("Die Anwendung hat das Skript nicht ausgeführt."));
+        assertFalse(Files.exists(CompareConfiguration.defaultReportFile(output)));
+    }
+
+    @Test
+    void rejectsReportDirectoryBeforeDictionaryReadsAndPreservesPreviousScript() throws Exception {
+        Dictionary reference = new Dictionary();
+        Dictionary target = new Dictionary();
+        Path output = Files.writeString(directory.resolve("sync.sql"), "previous");
+        OracleSchemaCompare compare = new OracleSchemaCompare(new CompareConfiguration("SOURCE", "TARGET", output, directory, List.of()));
+        assertThrows(java.io.IOException.class, () -> compare.writeSynchronizationScript(reference.connection, target.connection));
+        assertTrue(reference.boundSchemas.isEmpty());
+        assertTrue(target.boundSchemas.isEmpty());
+        assertEquals("previous", Files.readString(output));
     }
 
     private OracleSchemaCompare comparator(String source, String target, Path output) {

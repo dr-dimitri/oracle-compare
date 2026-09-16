@@ -1,6 +1,10 @@
 package de.axa.oraclecompare;
 
 import static de.axa.oraclecompare.SchemaDefinition.*;
+import static de.axa.oraclecompare.ComparisonPlan.Action.*;
+import static de.axa.oraclecompare.ComparisonPlan.ObjectType.*;
+
+import de.axa.oraclecompare.ComparisonPlan.Operation;
 
 import java.sql.SQLException;
 import java.util.ArrayDeque;
@@ -25,18 +29,23 @@ import java.util.TreeSet;
 final class SchemaComparisonPlanner {
     /** Liefert ein vollständiges SQL*Plus-/SQLcl-Skript; die Modelle werden nicht verändert. */
     String plan(SchemaDefinition reference, SchemaDefinition target, ExclusionFilter exclusions) throws SQLException {
+        return comparisonPlan(reference, target, exclusions).script();
+    }
+
+    /** Erstellt SQL und Berichtsdaten gemeinsam, einschließlich aller nötigen Hilfsoperationen. */
+    ComparisonPlan comparisonPlan(SchemaDefinition reference, SchemaDefinition target, ExclusionFilter exclusions) throws SQLException {
         Scope scope = new Scope(normalizeGeneratedNames(reference, target, exclusions), target, exclusions);
         SchemaDefinition desired = scope.desired;
         SchemaDefinition actual = scope.actual;
         OracleSqlRenderer render = new OracleSqlRenderer(desired.owner(), actual.owner());
         OracleSqlRenderer oldRender = new OracleSqlRenderer(actual.owner(), actual.owner());
         Set<String> changedTables = difference(actual.tables().keySet(), desired.tables().keySet());
-        List<String> tableStatements = new ArrayList<>();
+        List<Operation> tableStatements = new ArrayList<>();
         for (Table table : new TreeMap<>(desired.tables()).values()) {
             Table old = actual.tables().get(table.name());
             if (old == null) {
                 changedTables.add(table.name());
-                tableStatements.add(render.createTable(table));
+                tableStatements.add(new Operation(CREATE, TABLE, table.name(), null, render.createTable(table)));
             } else if (!render.createTable(table).equals(oldRender.createTable(old))
                     || !constraintSignatures(table, false, render).equals(constraintSignatures(old, false, oldRender))) {
                 for (Constraint constraint : table.constraints()) if (implicitNotNull(table, constraint)) {
@@ -47,7 +56,9 @@ final class SchemaComparisonPlanner {
                     }
                 }
                 changedTables.add(table.name());
-                tableStatements.addAll(render.alterTable(old, table, oldRender));
+                for (String sql : render.alterTable(old, table, oldRender)) {
+                    tableStatements.add(new Operation(ALTER, TABLE, table.name(), null, sql));
+                }
             }
         }
         // Eine Änderung am PK-/UK-Index benötigt zuerst das Lösen seines Constraints.
@@ -64,12 +75,12 @@ final class SchemaComparisonPlanner {
                 if (actualBacking.containsKey(name)) changedTables.add(actualBacking.get(name));
             }
         }
-        Map<String, String> viewStatements = new TreeMap<>();
+        Map<String, Operation> viewStatements = new TreeMap<>();
         Set<String> changedViews = difference(actual.views().keySet(), desired.views().keySet());
         for (View view : new TreeMap<>(desired.views()).values()) {
             View old = actual.views().get(view.name());
             if (old == null || !render.view(view).equals(oldRender.view(old))) {
-                viewStatements.put(view.name(), render.view(view));
+                viewStatements.put(view.name(), new Operation(old == null ? CREATE : ALTER, VIEW, view.name(), null, render.view(view)));
                 changedViews.add(view.name());
             }
         }
@@ -77,55 +88,56 @@ final class SchemaComparisonPlanner {
         validateRequiredDependencies(scope, render);
         boolean resetForeignKeys = !changedTables.isEmpty()
                 || !foreignKeySignatures(desired, render).equals(foreignKeySignatures(actual, oldRender));
-        List<String> commands = new ArrayList<>();
+        List<Operation> commands = new ArrayList<>();
         if (resetForeignKeys) for (Table table : new TreeMap<>(actual.tables()).values()) {
             for (Constraint constraint : sortedConstraints(table)) if ("R".equals(constraint.type())) {
-                commands.add(dropConstraint(actual.owner(), table.name(), constraint, false));
+                commands.add(new Operation(DROP, CONSTRAINT, constraint.name(), table.name(), dropConstraint(actual.owner(), table.name(), constraint, false)));
             }
         }
         List<String> oldViews = viewOrder(actual);
         Collections.reverse(oldViews);
-        for (String name : oldViews) if (!desired.views().containsKey(name)) commands.add(drop("VIEW", actual.owner(), name));
+        for (String name : oldViews) if (!desired.views().containsKey(name)) commands.add(new Operation(DROP, VIEW, name, null, drop("VIEW", actual.owner(), name)));
 
         // Freie Indizes vor DROP COLUMN entfernen, damit ein späteres DROP nicht auf fehlende Objekte trifft.
         for (Index index : new TreeMap<>(actual.indexes()).values()) {
             if (!actualBacking.containsKey(index.name()) && (changedIndexes.contains(index.name()) || changedTables.contains(index.tableName()))) {
-                commands.add(drop("INDEX", actual.owner(), index.name()));
+                commands.add(new Operation(DROP, INDEX, index.name(), index.tableName(), drop("INDEX", actual.owner(), index.name())));
             }
         }
         // Constraintnamen sind schemaweit eindeutig: Alle Namen freigeben, bevor neue Tabellen sie verwenden.
         for (Table table : new TreeMap<>(actual.tables()).values()) if (changedTables.contains(table.name()) && desired.tables().containsKey(table.name())) {
             for (Constraint constraint : sortedConstraints(table)) if (!"R".equals(constraint.type()) && !implicitNotNull(table, constraint)) {
-                commands.add(dropConstraint(actual.owner(), table.name(), constraint, true));
+                commands.add(new Operation(DROP, CONSTRAINT, constraint.name(), table.name(), dropConstraint(actual.owner(), table.name(), constraint, true)));
             }
         }
         for (Index index : new TreeMap<>(actual.indexes()).values()) {
-            if (actualBacking.containsKey(index.name()) && changedTables.contains(index.tableName()) && desired.tables().containsKey(index.tableName())) commands.add(drop("INDEX", actual.owner(), index.name()));
+            if (actualBacking.containsKey(index.name()) && changedTables.contains(index.tableName()) && desired.tables().containsKey(index.tableName())) commands.add(new Operation(DROP, INDEX, index.name(), index.tableName(), drop("INDEX", actual.owner(), index.name())));
         }
-        for (String name : difference(actual.tables().keySet(), desired.tables().keySet())) commands.add(drop("TABLE", actual.owner(), name));
-        for (String name : difference(actual.sequences().keySet(), desired.sequences().keySet())) commands.add(drop("SEQUENCE", actual.owner(), name));
+        for (String name : difference(actual.tables().keySet(), desired.tables().keySet())) commands.add(new Operation(DROP, TABLE, name, null, drop("TABLE", actual.owner(), name)));
+        for (String name : difference(actual.sequences().keySet(), desired.sequences().keySet())) commands.add(new Operation(DROP, SEQUENCE, name, null, drop("SEQUENCE", actual.owner(), name)));
         for (Sequence sequence : new TreeMap<>(desired.sequences()).values()) {
             Sequence old = actual.sequences().get(sequence.name());
-            if (old == null) commands.add(render.sequence(sequence, true));
-            else if (!render.sequence(sequence, false).equals(oldRender.sequence(old, false))) commands.add(render.sequence(sequence, false));
+            if (old == null) commands.add(new Operation(CREATE, SEQUENCE, sequence.name(), null, render.sequence(sequence, true)));
+            else if (!render.sequence(sequence, false).equals(oldRender.sequence(old, false))) commands.add(new Operation(ALTER, SEQUENCE, sequence.name(), null, render.sequence(sequence, false)));
         }
         commands.addAll(tableStatements);
         for (Index index : new TreeMap<>(desired.indexes()).values()) {
-            if (changedIndexes.contains(index.name()) || changedTables.contains(index.tableName())) commands.add(render.index(index));
+            if (changedIndexes.contains(index.name()) || changedTables.contains(index.tableName())) commands.add(new Operation(CREATE, INDEX, index.name(), index.tableName(), render.index(index)));
         }
         for (Table table : new TreeMap<>(desired.tables()).values()) if (changedTables.contains(table.name())) {
-            for (Constraint constraint : sortedConstraints(table)) if (!"R".equals(constraint.type()) && !implicitNotNull(table, constraint)) commands.add(render.constraint(table.name(), constraint));
+            for (Constraint constraint : sortedConstraints(table)) if (!"R".equals(constraint.type()) && !implicitNotNull(table, constraint)) commands.add(new Operation(CREATE, CONSTRAINT, constraint.name(), table.name(), render.constraint(table.name(), constraint)));
         }
         // Alle Tabellen und deren referenzierbare Schlüssel existieren jetzt, auch bei FK-Zyklen.
         if (resetForeignKeys) for (Table table : new TreeMap<>(desired.tables()).values()) {
-            for (Constraint constraint : sortedConstraints(table)) if ("R".equals(constraint.type())) commands.add(render.constraint(table.name(), constraint));
+            for (Constraint constraint : sortedConstraints(table)) if ("R".equals(constraint.type())) commands.add(new Operation(CREATE, CONSTRAINT, constraint.name(), table.name(), render.constraint(table.name(), constraint)));
         }
         for (String name : viewOrder(desired)) if (viewStatements.containsKey(name)) commands.add(viewStatements.get(name));
         if (!commands.isEmpty()) {
-            for (String name : viewOrder(desired)) commands.add("ALTER VIEW " + SqlText.qualified(actual.owner(), name) + " COMPILE;");
-            if (!desired.views().isEmpty()) commands.add(validateViews(actual.owner(), desired.views().keySet()));
+            for (String name : viewOrder(desired)) commands.add(new Operation(COMPILE, VIEW, name, null, "ALTER VIEW " + SqlText.qualified(actual.owner(), name) + " COMPILE;"));
+            if (!desired.views().isEmpty()) commands.add(new Operation(VALIDATE, SCHEMA, actual.owner(), null, validateViews(actual.owner(), desired.views().keySet())));
         }
-        return script(desired.owner(), actual.owner(), commands);
+        return new ComparisonPlan(desired.owner(), actual.owner(),
+                script(desired.owner(), actual.owner(), commands.stream().map(Operation::sql).toList()), commands);
     }
 
     /** Generierte Constraint-/Indexnamen sind Datenbankdetails, keine fachlichen Unterschiede. */

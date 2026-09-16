@@ -22,6 +22,7 @@ class CompareConfigurationTest {
                 reference.schema=Quelle Ä
                 target.schema=Ziel
                 output.path=sql/Abgleich ü.sql
+                report.path=reports/Bericht ü.md
                 exclude.10=REPORT\\\\*
                 exclude.2=Name, mit Komma
                 exclude.1=tmp_*
@@ -32,6 +33,7 @@ class CompareConfigurationTest {
         assertEquals("Quelle Ä", config.referenceSchema());
         assertEquals("Ziel", config.targetSchema());
         assertEquals(Path.of("sql/Abgleich ü.sql"), config.outputFile());
+        assertEquals(Path.of("reports/Bericht ü.md"), config.reportFile());
         assertEquals(List.of("tmp_*", "Name, mit Komma", "REPORT\\*"), config.excludedObjects());
         ExclusionFilter filter = new ExclusionFilter(config.excludedObjects());
         assertTrue(filter.excludes("TMP_DATA"));
@@ -70,6 +72,19 @@ class CompareConfigurationTest {
         assertThrows(IOException.class, () -> CompareConfiguration.load(directory.resolve("missing.properties")));
         Path file = Files.writeString(directory.resolve("malformed.properties"), "reference.schema=\\uXXXX");
         assertThrows(IOException.class, () -> CompareConfiguration.load(file));
+    }
+
+    @Test
+    void defaultsReportPathNextToSqlForExistingConfiguration() throws Exception {
+        assertEquals(Path.of("sync.sql.md"), CompareConfiguration.from(valid()).reportFile());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", " ", "/", "\u0000", "sync.sql", "sub/../sync.sql"})
+    void rejectsInvalidOrConflictingReportPath(String value) {
+        Properties properties = valid();
+        properties.setProperty("report.path", value);
+        assertThrows(IOException.class, () -> CompareConfiguration.from(properties));
     }
 
     private static Properties valid() {

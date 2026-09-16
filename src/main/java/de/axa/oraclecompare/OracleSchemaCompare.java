@@ -10,7 +10,8 @@ import java.util.Objects;
  * Vergleicht Oracle-19c-Schemata über eigene Java-Objekte und erzeugt ein SQL*Plus-/SQLcl-Skript.
  * Tabellen, Indizes, Views und Sequenzen werden aus Dictionary-Sichten gelesen; der Vergleich
  * und die SQL-Erzeugung erfolgen ausschließlich in Java. Das Skript gleicht das Ziel an die
- * Referenz an und enthält auch DROP für überzählige Objekte. Es wird nicht automatisch ausgeführt.
+ * Referenz an und enthält auch DROP für überzählige Objekte. Ein Markdown-Bericht dokumentiert
+ * die geplanten Schritte. Das SQL wird nicht automatisch ausgeführt.
  *
  * <p>Alle Einstellungen stammen aus {@code oracle-compare.properties} im Arbeitsverzeichnis.
  * Die Anwendung übergibt ausschließlich offene JDBC-Connections. Diese werden weder geschlossen
@@ -31,7 +32,10 @@ public final class OracleSchemaCompare {
     }
 
     /**
-     * Liest beide Schemata, plant alle Änderungen und schreibt erst nach erfolgreicher Prüfung.
+     * Liest beide Schemata, plant alle Änderungen und schreibt SQL und Markdown-Bericht erst
+     * nach erfolgreicher Prüfung. {@code report.path} bestimmt den Berichtspfad; ohne Angabe
+     * wird an den SQL-Dateinamen {@code .md} angehängt. Der Bericht ist UTF-8 mit CRLF kodiert
+     * und beschreibt die Planung, keine bereits ausgeführten Datenbankänderungen.
      * Unterschiedliche Datenbanken und identische Schemanamen auf getrennten Verbindungen sind
      * zulässig. Bei derselben Connection müssen die konfigurierten Schemanamen verschieden sein.
      *
@@ -46,6 +50,7 @@ public final class OracleSchemaCompare {
         Objects.requireNonNull(referenceConnection, "referenceConnection");
         Objects.requireNonNull(targetConnection, "targetConnection");
         CompareConfiguration settings = configuration == null ? CompareConfiguration.load() : configuration;
+        SqlScriptWriter.validateOutputs(settings.outputFile(), settings.reportFile());
         if (referenceConnection == targetConnection && settings.referenceSchema().equals(settings.targetSchema())) {
             throw new IllegalArgumentException("Auf derselben Connection müssen Referenz- und Zielschema verschieden sein.");
         }
@@ -55,7 +60,8 @@ public final class OracleSchemaCompare {
         ExclusionFilter exclusions = new ExclusionFilter(settings.excludedObjects());
         SchemaDefinition reference = new OracleDictionaryReader(referenceConnection).read(settings.referenceSchema(), exclusions);
         SchemaDefinition target = new OracleDictionaryReader(targetConnection).read(settings.targetSchema(), exclusions);
-        String script = new SchemaComparisonPlanner().plan(reference, target, exclusions);
-        return SqlScriptWriter.write(settings.outputFile(), script);
+        ComparisonPlan plan = new SchemaComparisonPlanner().comparisonPlan(reference, target, exclusions);
+        String report = new MarkdownReportRenderer().render(plan, settings);
+        return SqlScriptWriter.write(settings.outputFile(), plan.script(), settings.reportFile(), report);
     }
 }

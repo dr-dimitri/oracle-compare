@@ -4,6 +4,7 @@ import static de.axa.oraclecompare.SchemaDefinition.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -16,6 +17,38 @@ class SchemaComparisonPlannerTest {
     @Test
     void equalSchemasNeedNoObjectDdl() throws Exception {
         assertNoChanges(plan(new Fixture("SOURCE"), new Fixture("TARGET")));
+    }
+
+    @Test
+    void unchangedPlanHasNoReportedOperationsAndDefensivelyCopiesThem() throws Exception {
+        ComparisonPlan result = comparisonPlan(new Fixture("SOURCE"), new Fixture("TARGET"));
+        assertEquals("SOURCE", result.referenceSchema());
+        assertEquals("TARGET", result.targetSchema());
+        assertTrue(result.operations().isEmpty());
+        assertNoChanges(result.script());
+        List<ComparisonPlan.Operation> mutable = new ArrayList<>();
+        ComparisonPlan copy = new ComparisonPlan("SOURCE", "TARGET", result.script(), mutable);
+        mutable.add(new ComparisonPlan.Operation(ComparisonPlan.Action.DROP, ComparisonPlan.ObjectType.TABLE,
+                "T", null, "DROP TABLE T;"));
+        assertTrue(copy.operations().isEmpty());
+        assertThrows(UnsupportedOperationException.class, () -> copy.operations().addAll(mutable));
+    }
+
+    @Test
+    void reportsCreationAndValidationInTheExactSqlExecutionOrder() throws Exception {
+        Fixture source = new Fixture("SOURCE").table(table("T", pk("T_PK"), fk("T_FK", "SOURCE", "T")))
+                .sequence(sequence("ID_SEQ", "100"))
+                .index(index("T_IX", "SOURCE", "T", "ID", false));
+        source.view("T_VIEW", "SELECT ID FROM \"SOURCE\".\"T\"", "T");
+        Fixture target = new Fixture("TARGET");
+
+        ComparisonPlan result = comparisonPlan(source, target);
+
+        assertEquals(List.of("CREATE SEQUENCE ID_SEQ", "CREATE TABLE T", "CREATE INDEX T_IX ON T",
+                "CREATE CONSTRAINT T_PK ON T", "CREATE CONSTRAINT T_FK ON T", "CREATE VIEW T_VIEW",
+                "COMPILE VIEW T_VIEW", "VALIDATE SCHEMA TARGET"), operationLabels(result));
+        assertEquals(plan(source, target), result.script());
+        assertOperationsMatchScript(result);
     }
 
     @Test
@@ -45,12 +78,17 @@ class SchemaComparisonPlannerTest {
         source.index(index("P_LABEL_IX", "SOURCE", "P", "LABEL", false));
         target.index(index("P_LABEL_IX", "TARGET", "P", "LABEL", false));
 
-        String sql = plan(source, target);
+        ComparisonPlan result = comparisonPlan(source, target);
+        String sql = result.script();
 
         before(sql, "DROP CONSTRAINT \"C_P_FK\"", "DROP CONSTRAINT \"P_PK\"");
         before(sql, "DROP INDEX \"TARGET\".\"P_LABEL_IX\"", "MODIFY (\"LABEL\" VARCHAR2(100 CHAR))");
         before(sql, "MODIFY (\"LABEL\" VARCHAR2(100 CHAR))", "CREATE INDEX \"TARGET\".\"P_LABEL_IX\"");
         before(sql, "ADD CONSTRAINT \"P_PK\"", "ADD CONSTRAINT \"C_P_FK\"");
+        assertEquals(List.of("DROP CONSTRAINT C_P_FK ON C", "DROP INDEX P_LABEL_IX ON P", "DROP CONSTRAINT P_PK ON P",
+                "ALTER TABLE P", "CREATE INDEX P_LABEL_IX ON P", "CREATE CONSTRAINT P_PK ON P",
+                "CREATE CONSTRAINT C_P_FK ON C"), operationLabels(result));
+        assertOperationsMatchScript(result);
     }
 
     @Test
@@ -72,11 +110,32 @@ class SchemaComparisonPlannerTest {
         target.view("EXTRA_VIEW", "SELECT ID FROM \"TARGET\".\"EXTRA_TABLE\"", "EXTRA_TABLE");
         target.sequence(sequence("EXTRA_SEQ", "20"));
 
-        String sql = plan(new Fixture("SOURCE"), target);
+        ComparisonPlan result = comparisonPlan(new Fixture("SOURCE"), target);
+        String sql = result.script();
 
         before(sql, "DROP VIEW \"TARGET\".\"EXTRA_VIEW\"", "DROP TABLE \"TARGET\".\"EXTRA_TABLE\"");
         before(sql, "DROP INDEX \"TARGET\".\"EXTRA_IX\"", "DROP TABLE \"TARGET\".\"EXTRA_TABLE\"");
         assertTrue(sql.contains("DROP SEQUENCE \"TARGET\".\"EXTRA_SEQ\";"));
+        assertEquals(List.of("DROP VIEW EXTRA_VIEW", "DROP INDEX EXTRA_IX ON EXTRA_TABLE", "DROP TABLE EXTRA_TABLE",
+                "DROP SEQUENCE EXTRA_SEQ"), operationLabels(result));
+        assertOperationsMatchScript(result);
+    }
+
+    @Test
+    void reportsEachTableAlterAndDistinguishesViewReplacementFromCreation() throws Exception {
+        Fixture source = new Fixture("SOURCE").table(new Table("T", List.of(number("ID"), varchar("LABEL", 100), number("EXTRA")), List.of(), Map.of(), null, null));
+        Fixture target = new Fixture("TARGET").table(new Table("T", List.of(number("ID"), varchar("LABEL", 50)), List.of(), Map.of(), null, null));
+        source.view("OLD_VIEW", "SELECT ID + 1 FROM \"SOURCE\".\"T\"", "T");
+        target.view("OLD_VIEW", "SELECT ID FROM \"TARGET\".\"T\"", "T");
+        source.view("NEW_VIEW", "SELECT ID FROM \"SOURCE\".\"T\"", "T");
+        source.sequence(new Sequence("ID_SEQ", "1", "9999999999999999999999999999", "1", "50", false, false, "1", Map.of()));
+        target.sequence(sequence("ID_SEQ", "20"));
+
+        ComparisonPlan result = comparisonPlan(source, target);
+
+        assertEquals(List.of("ALTER SEQUENCE ID_SEQ", "ALTER TABLE T", "ALTER TABLE T", "CREATE VIEW NEW_VIEW",
+                "ALTER VIEW OLD_VIEW", "COMPILE VIEW NEW_VIEW", "COMPILE VIEW OLD_VIEW", "VALIDATE SCHEMA TARGET"), operationLabels(result));
+        assertOperationsMatchScript(result);
     }
 
     @Test
@@ -191,6 +250,23 @@ class SchemaComparisonPlannerTest {
 
     private static String plan(Fixture source, Fixture target, String... exclusions) throws SQLException {
         return new SchemaComparisonPlanner().plan(source.schema(), target.schema(), new ExclusionFilter(List.of(exclusions)));
+    }
+
+    private static ComparisonPlan comparisonPlan(Fixture source, Fixture target, String... exclusions) throws SQLException {
+        return new SchemaComparisonPlanner().comparisonPlan(source.schema(), target.schema(), new ExclusionFilter(List.of(exclusions)));
+    }
+
+    private static List<String> operationLabels(ComparisonPlan plan) {
+        return plan.operations().stream().map(operation -> operation.action() + " " + operation.objectType() + " "
+                + operation.objectName() + (operation.tableName() == null ? "" : " ON " + operation.tableName())).toList();
+    }
+
+    /** Vergleicht vollständig zerlegte SQL-Anweisungen; Session-Einstellungen sind keine Objektänderung. */
+    private static void assertOperationsMatchScript(ComparisonPlan plan) throws Exception {
+        List<String> expected = new ArrayList<>();
+        for (ComparisonPlan.Operation operation : plan.operations()) expected.addAll(OracleSqlScript.statements(operation.sql()));
+        List<String> actual = OracleSqlScript.statements(plan.script());
+        assertEquals(expected, actual.subList(1, actual.size()));
     }
 
     private static void before(String sql, String first, String second) {

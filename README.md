@@ -8,7 +8,8 @@ Die bisherigen paketbasierten Klassen und der Kommandozeileneinstieg wurden entf
 Der Abgleich bringt das **Zielschema auf den Stand der Referenz**: Tabellen einschließlich
 Constraints, Indizes, normale Views und Sequenzen. Fehlende Objekte werden angelegt,
 bestehende Definitionen geändert und überzählige Zielobjekte gelöscht. Die Bibliothek schreibt
-ein SQL*Plus-/SQLcl-Skript und führt es nicht aus. Tabelleninhalte werden nicht kopiert.
+ein SQL*Plus-/SQLcl-Skript sowie einen Markdown-Änderungsbericht und führt das SQL nicht aus.
+Tabelleninhalte werden nicht kopiert.
 
 ## Öffentliche API
 
@@ -45,6 +46,7 @@ dem Classpath geladen. Die mitgelieferte Datei ist eine Vorlage und muss angepas
 reference.schema=REFERENZ
 target.schema=ZIEL
 output.path=sql/abgleich-ziel.sql
+report.path=reports/abgleich-ziel.md
 exclude.1=AUDIT_LOG
 exclude.2=TMP_*
 exclude.3=*_BACKUP?
@@ -55,6 +57,12 @@ Dictionary, ohne äußere SQL-Anführungszeichen: `APP` oder beispielsweise `Mei
 gequotet angelegten Benutzer. Relative Ausgabepfade beziehen sich auf das Arbeitsverzeichnis.
 Die Properties-Datei ist UTF-8; Zugangsdaten gehören nicht hinein. Fehlende, unbekannte oder
 ungültige Eigenschaften führen vor den Dictionary-Abfragen zum Fehler.
+
+`report.path` ist optional und bestimmt die Markdown-Datei. Ohne Angabe wird an den SQL-Pfad
+`.md` angehängt, beispielsweise `sql/abgleich-ziel.sql.md`. Ein expliziter leerer Wert ist ungültig.
+SQL und Bericht müssen unterschiedliche Dateien bezeichnen; im selben Verzeichnis reicht ein
+Unterschied nur in der Groß-/Kleinschreibung nicht aus. Die öffentliche Methode erhält
+weiterhin nur die beiden Connections und liefert den SQL-Dateipfad zurück.
 
 Ausschlüsse sind optional und werden als `exclude.1`, `exclude.2` usw. eingetragen. Positive
 Nummern dürfen Lücken haben. Ein Eintrag bezeichnet ein vollständiges Muster; Kommas innerhalb
@@ -92,6 +100,8 @@ Daten neue Datentypen oder Constraints erfüllen.
 - `OracleDictionaryReader` liest das Modell über gebundene Schema-/Objektparameter. LONG-Felder
   wie View-Texte, Defaults und Check-Ausdrücke werden vollständig gelesen.
 - `SchemaComparisonPlanner` vergleicht die Definitionen und prüft Abhängigkeiten und Ausschlüsse.
+  Sein unveränderlicher `ComparisonPlan` enthält SQL und strukturierte Operationen in Ausführungsreihenfolge.
+- `MarkdownReportRenderer` dokumentiert diesen Plan mit Zusammenfassung, Objektübersicht und SQL je Schritt.
 - `OracleSqlRenderer` erzeugt Oracle-DDL aus dem Modell, einschließlich Schema-Remapping für
   eingebettete SQL-Ausdrücke. Literale, Kommentare und entfernte DB-Link-Referenzen bleiben erhalten.
 - `OracleSchemaCompare` kapselt Konfiguration, beide Verbindungen und die Dateiausgabe.
@@ -134,11 +144,21 @@ dynamisches SQL innerhalb von Literalen wird nicht umgeschrieben.
 
 ## Ausgabe und Ausführung
 
-Die Ausgabe verwendet **Windows-1252 mit CRLF-Zeilenumbrüchen**. Nicht darstellbare Zeichen
-führen zu einer `IOException`. Fehlende Verzeichnisse werden angelegt; Verzeichnislinks werden
-unterstützt. Erst nach vollständiger Planung und erfolgreichem Schreiben ersetzt eine temporäre
-Datei das Ergebnis. Die Ersetzung erfolgt atomar, wenn das Dateisystem `ATOMIC_MOVE` unterstützt;
-andernfalls wird die vollständig geschriebene Datei per normalem Move ersetzt.
+Das SQL verwendet **Windows-1252 mit CRLF-Zeilenumbrüchen**, der Markdown-Bericht **UTF-8 mit CRLF**.
+Im SQL nicht darstellbare Zeichen führen zu einer `IOException`. Fehlende Verzeichnisse werden
+angelegt; Verzeichnislinks werden unterstützt. SQL und Bericht werden zunächst vollständig in
+temporäre Dateien geschrieben. Erst danach werden die Ausgabedateien ersetzt. Jede einzelne
+Ersetzung erfolgt atomar, wenn das Dateisystem `ATOMIC_MOVE` unterstützt; andernfalls per normalem
+Move. Bei einem Fehler während der Ersetzung wird die Wiederherstellung bereits ersetzter Dateien
+versucht. Die beiden Dateien bilden keine atomare Transaktion, insbesondere bei Prozessabbruch
+oder über mehrere Dateisysteme hinweg. Datei-Symlinks als Ausgabeziel werden abgelehnt.
+
+Der Bericht beschreibt **geplante Änderungen**, keine bereits ausgeführten Datenbankänderungen.
+Er enthält Referenz- und Zielschema, Ausgabepfade, Ausschlussmuster, die Anzahl der Operationen
+pro Aktion und alle Schritte mit Objekttyp, Objektname und SQL. Auch das vorübergehende Entfernen
+und Wiederanlegen von Fremdschlüsseln oder Indizes sowie View-Kompilierungen und Prüfungen sind
+enthalten. Die Zählung bezieht sich auf SQL-Operationen, nicht auf unterschiedliche Objekte.
+Bei identischen Definitionen dokumentiert der Bericht, dass keine Objektänderungen geplant sind.
 
 Das Skript als Zielbenutzer oder ausreichend berechtigter Benutzer in SQL*Plus/SQLcl ausführen:
 
@@ -186,6 +206,8 @@ mit einer eindeutigen Datei in `EXPORT_HOST`. Bei getrennten Hosts wird dieselbe
 
 Der Test erzeugt und führt den Abgleich aus, prüft FK-/View-/Partitionszustände und externen
 Lesezugriff und verlangt danach einen zweiten Abgleich ohne weitere Objekt-DDL.
+Neben dem angegebenen SQL-Pfad bleibt der Markdown-Bericht mit zusätzlicher Endung `.md` erhalten;
+temporäre Dateien des zweiten Abgleichs werden entfernt.
 Testobjekte und Dumpdateien bleiben zur Untersuchung erhalten und sind anschließend durch die
 Testumgebung aufzuräumen. `mvn verify` startet diesen Datenbanktest nicht automatisch.
 Ein Lauf gegen echte Oracle-Datenbanken wurde in der Entwicklungsumgebung nicht ausgeführt.
