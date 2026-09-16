@@ -1,6 +1,10 @@
 package de.axa.oraclecompare;
 
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 /** SQL-Bezeichner und lexikalisches Schema-Remapping ohne Änderungen an Literalen/Kommentaren. */
 final class SqlText {
@@ -16,6 +20,50 @@ final class SqlText {
 
     static String qualified(String schema, String name) {
         return identifier(schema) + "." + identifier(name);
+    }
+
+    /**
+     * Ermittelt lokale Sequenzen aus NEXTVAL-/CURRVAL-Ausdrücken eines Spalten-Defaults.
+     * Unqualifizierte Namen gehören zum angegebenen Schema; quotierte Namen behalten ihre
+     * Schreibweise. Literale, Kommentare und Referenzen über Datenbank-Links zählen nicht.
+     */
+    static Set<String> localSequenceReferences(String expression, String schema) {
+        if (expression == null) return Set.of();
+        Set<String> sequences = new HashSet<>();
+        int i = 0;
+        while ((i = skipTrivia(expression, i)) < expression.length()) {
+            char c = expression.charAt(i);
+            int quote = alternativeQuoteOffset(expression, i);
+            if (quote >= 0) {
+                i = alternativeQuotedEnd(expression, quote);
+            } else if (c == '\'') {
+                i = quotedEnd(expression, i, '\'');
+            } else if (c == '@') {
+                i = qualifiedIdentifierEnd(expression, i + 1);
+            } else if (isIdentifierStart(c)) {
+                List<String> parts = new ArrayList<>();
+                while (true) {
+                    int end = identifierEnd(expression, i);
+                    parts.add(identifierValue(expression, i, end));
+                    i = skipTrivia(expression, end);
+                    if (i >= expression.length() || expression.charAt(i) != '.') break;
+                    int next = skipTrivia(expression, i + 1);
+                    if (next >= expression.length() || !isIdentifierStart(expression.charAt(next))) break;
+                    i = next;
+                }
+                if (i < expression.length() && expression.charAt(i) == '@') {
+                    i = qualifiedIdentifierEnd(expression, i + 1);
+                    continue;
+                }
+                if ((parts.size() == 2 || parts.size() == 3 && parts.get(0).equals(schema))
+                        && Set.of("NEXTVAL", "CURRVAL").contains(parts.get(parts.size() - 1))) {
+                    sequences.add(parts.get(parts.size() - 2));
+                }
+            } else {
+                i++;
+            }
+        }
+        return Set.copyOf(sequences);
     }
 
     /**
@@ -41,10 +89,7 @@ final class SqlText {
                 i = end < 0 ? sql.length() : end + 2;
             } else if (alternativeQuoteOffset(sql, i) >= 0) {
                 int quote = alternativeQuoteOffset(sql, i);
-                char open = sql.charAt(quote + 1);
-                char close = switch (open) { case '[' -> ']'; case '(' -> ')'; case '{' -> '}'; case '<' -> '>'; default -> open; };
-                int end = sql.indexOf("" + close + '\'', quote + 2);
-                i = end < 0 ? sql.length() : end + 2;
+                i = alternativeQuotedEnd(sql, quote);
                 previousDot = false;
             } else if (c == '\'') {
                 i = quotedEnd(sql, i, '\'');
@@ -54,13 +99,8 @@ final class SqlText {
                 i = qualifiedIdentifierEnd(sql, i + 1);
                 previousDot = false;
             } else if (isIdentifierStart(c)) {
-                String token;
                 i = identifierEnd(sql, i);
-                if (c == '"') {
-                    token = sql.substring(start + 1, i - 1).replace("\"\"", "\"");
-                } else {
-                    token = sql.substring(start, i).toUpperCase(Locale.ROOT);
-                }
+                String token = identifierValue(sql, start, i);
                 int next = skipTrivia(sql, i);
                 boolean remap = !previousDot && token.equals(source)
                         && next < sql.length() && sql.charAt(next) == '.'
@@ -116,6 +156,18 @@ final class SqlText {
         if (text.charAt(q) == 'n' || text.charAt(q) == 'N') q++;
         return q + 2 < text.length() && (text.charAt(q) == 'q' || text.charAt(q) == 'Q')
                 && text.charAt(q + 1) == '\'' ? q + 1 : -1;
+    }
+
+    private static int alternativeQuotedEnd(String text, int quote) {
+        char open = text.charAt(quote + 1);
+        char close = switch (open) { case '[' -> ']'; case '(' -> ')'; case '{' -> '}'; case '<' -> '>'; default -> open; };
+        int end = text.indexOf("" + close + '\'', quote + 2);
+        return end < 0 ? text.length() : end + 2;
+    }
+
+    private static String identifierValue(String text, int start, int end) {
+        return text.charAt(start) == '"' ? text.substring(start + 1, end - 1).replace("\"\"", "\"")
+                : text.substring(start, end).toUpperCase(Locale.ROOT);
     }
 
     private static int quotedEnd(String text, int start, char quote) {

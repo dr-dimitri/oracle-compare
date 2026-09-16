@@ -34,6 +34,13 @@ class OracleSchemaIntegrationTest {
         assertTrue(reference.contains("PARTITION BY RANGE"));
         assertTrue(reference.contains("PARTITION BY LIST"));
         assertTrue(reference.contains("GLOBAL PARTITION BY RANGE"));
+        assertTrue(reference.contains("GLOBAL PARTITION BY HASH"));
+        assertTrue(reference.contains("COLUMN_REPLACE (NEW_COL NUMBER)"));
+        assertTrue(target.contains("COLUMN_REPLACE (OLD_COL NUMBER)"));
+        assertTrue(target.contains("VIRTUAL_COL NUMBER GENERATED ALWAYS AS (BASE_COL + 1) VIRTUAL"));
+        assertTrue(reference.contains("READ_ONLY_CHANGE (ID NUMBER) READ ONLY"));
+        assertTrue(target.contains("READ_ONLY_KEEP (ID NUMBER, OLD_COL NUMBER) READ ONLY"));
+        assertTrue(reference.contains("LONG_CHANGE (ID NUMBER, NEW_COL LONG)"));
         assertTrue(reference.contains("PART_RANGE_SALES(REGION) LOCAL"));
         assertTrue(target.contains("EXTRA_PART_TABLE"));
     }

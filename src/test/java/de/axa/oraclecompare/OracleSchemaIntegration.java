@@ -231,7 +231,16 @@ public final class OracleSchemaIntegration {
         requirePairs(connection, schema,
                 "SELECT index_name, locality FROM all_part_indexes WHERE owner = ?",
                 Map.of("PART_RANGE_LOCAL_IX", "LOCAL", "PART_RANGE_GLOBAL_IX", "GLOBAL",
-                        "PART_LIST_LOCAL_IX", "LOCAL"), "Indexpartitionierung");
+                        "PART_HASH_GLOBAL_IX", "GLOBAL", "PART_LIST_LOCAL_IX", "LOCAL"), "Indexpartitionierung");
+        requirePairs(connection, schema, """
+                SELECT table_name, read_only FROM all_tables
+                WHERE owner = ? AND table_name IN ('READ_ONLY_CHANGE', 'READ_ONLY_KEEP')
+                """, Map.of("READ_ONLY_CHANGE", "YES", "READ_ONLY_KEEP", "YES"), "Schreibschutz nach Spaltenabbau");
+        requirePairs(connection, schema, """
+                SELECT table_name || '.' || column_name, data_type FROM all_tab_columns
+                WHERE owner = ? AND table_name IN ('COLUMN_REPLACE', 'VIRTUAL_DROP', 'LONG_CHANGE')
+                """, Map.of("COLUMN_REPLACE.NEW_COL", "NUMBER", "VIRTUAL_DROP.ID", "NUMBER",
+                        "LONG_CHANGE.ID", "NUMBER", "LONG_CHANGE.NEW_COL", "LONG"), "Spaltenwechsel");
         requirePairs(connection, schema, """
                 SELECT table_name || '.' || partition_name, TO_CHAR(partition_position)
                 FROM all_tab_partitions WHERE table_owner = ?

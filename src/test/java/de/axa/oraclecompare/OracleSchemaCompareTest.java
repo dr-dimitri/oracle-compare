@@ -37,6 +37,8 @@ class OracleSchemaCompareTest {
         assertTrue(target.boundSchemas.stream().allMatch("TARGET"::equals));
         assertFalse(reference.boundSchemas.isEmpty());
         assertFalse(target.boundSchemas.isEmpty());
+        assertEquals(0, reference.parameterQueries);
+        assertEquals(1, target.parameterQueries);
         assertTrue(Files.readString(output, Charset.forName("windows-1252"))
                 .contains("ALTER SESSION SET CURRENT_SCHEMA = \"TARGET\";"));
         String report = Files.readString(CompareConfiguration.defaultReportFile(output));
@@ -102,6 +104,46 @@ class OracleSchemaCompareTest {
                 .writeSynchronizationScript(reference.connection, target.connection));
         assertTrue(reference.boundSchemas.isEmpty());
         assertTrue(target.boundSchemas.isEmpty());
+        assertEquals(0, reference.parameterQueries);
+        assertEquals(0, target.parameterQueries);
+    }
+
+    @Test
+    void targetCapabilityFailurePreservesArtifactsAndPreventsDictionaryReads() throws Exception {
+        Dictionary reference = new Dictionary();
+        Dictionary target = new Dictionary();
+        target.parameterFailure = new SQLException("Missing V$PARAMETER privilege", "42000", 942);
+        Path output = Files.writeString(directory.resolve("sync.sql"), "previous complete script");
+        Path report = Files.writeString(CompareConfiguration.defaultReportFile(output), "previous complete report");
+
+        SQLException failure = assertThrows(SQLException.class, () -> comparator("SOURCE", "TARGET", output)
+                .writeSynchronizationScript(reference.connection, target.connection));
+
+        assertEquals(942, failure.getErrorCode());
+        assertEquals("previous complete script", Files.readString(output));
+        assertEquals("previous complete report", Files.readString(report));
+        assertTrue(reference.boundSchemas.isEmpty());
+        assertTrue(target.boundSchemas.isEmpty());
+        assertEquals(0, reference.parameterQueries);
+        assertEquals(1, target.parameterQueries);
+        reference.assertReleased();
+        target.assertReleased();
+    }
+
+    @Test
+    void acceptsStandardTargetWithoutReadingSourceCapabilities() throws Exception {
+        Dictionary reference = new Dictionary();
+        Dictionary target = new Dictionary();
+        reference.parameterFailure = new SQLException("Source parameter access is unnecessary");
+        target.maxStringSize = "STANDARD";
+
+        comparator("SOURCE", "TARGET", directory.resolve("standard.sql"))
+                .writeSynchronizationScript(reference.connection, target.connection);
+
+        assertEquals(0, reference.parameterQueries);
+        assertEquals(1, target.parameterQueries);
+        reference.assertReleased();
+        target.assertReleased();
     }
 
     @Test
@@ -138,8 +180,11 @@ class OracleSchemaCompareTest {
         final List<String> boundSchemas = new ArrayList<>();
         int statements;
         int resultSets;
+        int parameterQueries;
         boolean closed;
         SQLException failure;
+        SQLException parameterFailure;
+        String maxStringSize = "EXTENDED";
         final Connection connection = proxy(Connection.class, (object, method, args) -> switch (method.getName()) {
             case "isClosed" -> closed;
             case "prepareStatement" -> statement((String) args[0]);
@@ -156,11 +201,30 @@ class OracleSchemaCompareTest {
                 case "setString" -> { bindings.put((Integer) args[0], (String) args[1]); yield null; }
                 case "executeQuery" -> {
                     boundSchemas.addAll(bindings.values());
+                    if (normalized.contains("FROM V$PARAMETER")) {
+                        parameterQueries++;
+                        if (parameterFailure != null) throw parameterFailure;
+                        yield parameterRows();
+                    }
                     if (failure != null) throw failure;
                     yield rows(normalized.contains("FROM DBA_USERS"), bindings.get(1));
                 }
                 case "close" -> { statements--; yield null; }
                 default -> throw new AssertionError("Unerwartete Statement-Operation: " + method.getName());
+            });
+        }
+
+        ResultSet parameterRows() {
+            resultSets++;
+            List<Map<String, String>> parameters = List.of(
+                    Map.of("NAME", "max_string_size", "VALUE", maxStringSize, "CONTAINER_NAME", "APP_PDB"),
+                    Map.of("NAME", "compatible", "VALUE", "19.0.0", "CONTAINER_NAME", "APP_PDB"));
+            int[] cursor = {-1};
+            return proxy(ResultSet.class, (object, method, args) -> switch (method.getName()) {
+                case "next" -> ++cursor[0] < parameters.size();
+                case "getString" -> parameters.get(cursor[0]).get(args[0]);
+                case "close" -> { resultSets--; yield null; }
+                default -> throw new AssertionError("Unerwartete Parameter-ResultSet-Operation: " + method.getName());
             });
         }
 

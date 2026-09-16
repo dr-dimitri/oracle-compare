@@ -58,7 +58,7 @@ final class OracleDictionaryReader {
         Set<String> excludedTables = excludedTables(owner, exclusions, tableRows, indexRows);
         Map<String, List<Constraint>> constraints = readConstraints(owner);
         Map<String, List<Column>> columns = readColumns(owner, excludedTables);
-        Map<String, List<Lob>> lobs = readLobs(owner, excludedTables, columns);
+        Map<String, List<Lob>> lobs = readLobs(owner, names(tableRows, "TABLE_NAME"), excludedTables, columns);
         Map<String, Row> partitionTables = byName(query("SELECT p.* FROM dba_part_tables p WHERE owner = ?", owner), "TABLE_NAME");
         Map<String, Row> partitionIndexes = byName(query("SELECT p.* FROM dba_part_indexes p WHERE owner = ?", owner), "INDEX_NAME");
         Map<String, Row> externalTables = byName(query("SELECT e.* FROM dba_external_tables e WHERE owner = ?", owner), "TABLE_NAME");
@@ -80,6 +80,9 @@ final class OracleDictionaryReader {
                 if (templateTables.contains(name)) unsupported(owner, name, "Subpartition-Template");
             }
             Row partition = partitionTables.get(name);
+            if (!excluded && partition != null && externalTables.containsKey(name)) {
+                unsupported(owner, name, "partitionierte externe Tabelle mit partitionsbezogenen Dateiquellen");
+            }
             Map<String, String> attributes = attributes(row, PHYSICAL);
             addAttributes(attributes, row, "TEMPORARY", "DURATION", "ROW_MOVEMENT", "CACHE", "READ_ONLY", "DEGREE", "INSTANCES", "DEPENDENCIES", "DEFAULT_COLLATION");
             if (!excluded && partition != null) mergePartitionDefaults(attributes, partition, blockSizes, false);
@@ -136,8 +139,9 @@ final class OracleDictionaryReader {
         return result;
     }
 
-    /** Liest eigenständige BasicFile-/SecureFile-Speicherung einschließlich expliziter Segmentnamen. */
-    private Map<String, List<Lob>> readLobs(String owner, Set<String> excludedTables, Map<String, List<Column>> columns) throws SQLException {
+    /** Liest LOB-Speicherung nur für inventarisierte, ausgewählte Tabellen; interne Objekte bleiben unberührt. */
+    private Map<String, List<Lob>> readLobs(String owner, Set<String> tableNames, Set<String> excludedTables,
+                                            Map<String, List<Column>> columns) throws SQLException {
         Map<String, List<Lob>> result = new LinkedHashMap<>();
         for (Row row : query("""
                 SELECT l.*, o.generated AS segment_generated FROM dba_lobs l
@@ -145,7 +149,7 @@ final class OracleDictionaryReader {
                  WHERE l.owner = ? ORDER BY l.table_name, l.column_name
                 """, owner)) {
             String table = row.get("TABLE_NAME");
-            if (excludedTables.contains(table)) continue;
+            if (!tableNames.contains(table) || excludedTables.contains(table)) continue;
             if (row.is("PARTITIONED", "YES") || row.is("ENCRYPT", "YES") || row.is("RETENTION_TYPE", "MAX")) {
                 unsupported(owner, table, "partitionierte/verschlüsselte LOB-Speicherung oder RETENTION MAX ohne öffentliches MAXSIZE-Metadatum");
             }
@@ -172,7 +176,10 @@ final class OracleDictionaryReader {
         return result;
     }
 
-    /** Liest LONG-Defaults vollständig; unsichtbare Benutzerspalten bleiben im Modell enthalten. */
+    /**
+     * Liest LONG-Defaults vollständig; unsichtbare Benutzerspalten bleiben im Modell enthalten.
+     * Ausgeschlossene Tabellen behalten nur Spaltennamen und Defaults zum Schutz abhängiger Sequenzen.
+     */
     private Map<String, List<Column>> readColumns(String owner, Set<String> excludedTables) throws SQLException {
         Map<String, Identity> identities = new LinkedHashMap<>();
         for (Row row : query("SELECT table_name, column_name, generation_type, identity_options FROM dba_tab_identity_cols WHERE owner = ?", owner)) {
@@ -188,8 +195,15 @@ final class OracleDictionaryReader {
                  ORDER BY table_name, column_id NULLS LAST, internal_column_id
                 """, owner)) {
             String table = row.get("TABLE_NAME");
-            if (excludedTables.contains(table)) continue;
             Identity identity = identities.get(key(table, row.get("COLUMN_NAME")));
+            if (excludedTables.contains(table)) {
+                String expression = row.is("IDENTITY_COLUMN", "YES") || identity != null ? null
+                        : normalizeDefault(row.get("DATA_DEFAULT"), row.is("VIRTUAL_COLUMN", "YES"));
+                result.computeIfAbsent(table, ignored -> new ArrayList<>()).add(new Column(row.get("COLUMN_NAME"),
+                        null, null, null, null, null, null, null, expression,
+                        row.is("NULLABLE", "Y"), row.is("VIRTUAL_COLUMN", "YES"), false, false, null, null));
+                continue;
+            }
             if (identity != null && "BY DEFAULT".equals(identity.generationType()) && row.is("DEFAULT_ON_NULL", "YES")) {
                 identity = new Identity("BY DEFAULT ON NULL", identity.options());
             }
@@ -217,7 +231,7 @@ final class OracleDictionaryReader {
                 SELECT c.table_name, c.constraint_name, c.constraint_type, c.r_owner, c.r_constraint_name,
                        c.delete_rule, c.deferrable, c.deferred, c.status, c.validated, c.rely, c.generated,
                        c.index_owner, c.index_name, c.search_condition
-                  FROM dba_constraints c WHERE c.owner = ? AND c.constraint_type IN ('P', 'U', 'C', 'R')
+                  FROM dba_constraints c WHERE c.owner = ? AND c.constraint_type IN ('P', 'U', 'C', 'R', 'V', 'O')
                  ORDER BY c.table_name, c.constraint_name
                 """, owner)) {
             String referencedTable = null;

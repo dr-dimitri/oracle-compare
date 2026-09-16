@@ -38,6 +38,8 @@ public final class OracleSchemaCompare {
      * und beschreibt die Planung, keine bereits ausgeführten Datenbankänderungen.
      * Unterschiedliche Datenbanken und identische Schemanamen auf getrennten Verbindungen sind
      * zulässig. Bei derselben Connection müssen die konfigurierten Schemanamen verschieden sein.
+     * Die Zielverbindung benötigt zusätzlich Leserechte auf {@code V$PARAMETER}, damit die
+     * erzeugten COLLATION-Klauseln zu MAX_STRING_SIZE und COMPATIBLE der Zieldatenbank passen.
      *
      * @param referenceConnection offene Verbindung zur Referenzdatenbank; bleibt beim Aufrufer
      * @param targetConnection offene Verbindung zur Zieldatenbank; bleibt beim Aufrufer
@@ -57,10 +59,12 @@ public final class OracleSchemaCompare {
         if (referenceConnection.isClosed() || targetConnection.isClosed()) {
             throw new SQLException("Eine JDBC-Connection ist geschlossen.");
         }
+        OracleDatabaseCapabilities targetCapabilities = OracleDatabaseCapabilities.read(targetConnection);
         ExclusionFilter exclusions = new ExclusionFilter(settings.excludedObjects());
         SchemaDefinition reference = new OracleDictionaryReader(referenceConnection).read(settings.referenceSchema(), exclusions);
         SchemaDefinition target = new OracleDictionaryReader(targetConnection).read(settings.targetSchema(), exclusions);
-        ComparisonPlan plan = new SchemaComparisonPlanner().comparisonPlan(reference, target, exclusions);
+        ComparisonPlan plan = new SchemaComparisonPlanner(targetCapabilities.supportsDataBoundCollation())
+                .comparisonPlan(reference, target, exclusions);
         String report = new MarkdownReportRenderer().render(plan, settings);
         return SqlScriptWriter.write(settings.outputFile(), plan.script(), settings.reportFile(), report);
     }

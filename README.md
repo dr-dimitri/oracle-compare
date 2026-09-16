@@ -35,6 +35,9 @@ Statements und ResultSets werden auch im Fehlerfall geschlossen.
 Während eines Aufrufs die Connections exklusiv verwenden und parallele Schema-DDL vermeiden.
 Beide Benutzer benötigen Leserechte auf die verwendeten `DBA_*`-Sichten, typischerweise über
 `SELECT_CATALOG_ROLE`. Zugriff auf die beiden bisherigen Metadaten-Packages ist nicht nötig.
+Die Zielverbindung benötigt außerdem Lesezugriff auf `V$PARAMETER` (`SYS.V_$PARAMETER`),
+um `MAX_STRING_SIZE` und `COMPATIBLE` zu prüfen. Der aktuelle Container wird mit `SYS_CONTEXT`
+ermittelt; Session- und Datenbankparameter werden dabei nicht geändert.
 
 ## Konfiguration im Arbeitsverzeichnis
 
@@ -92,6 +95,10 @@ Referenzen über Datenbanklinks werden nicht mit gleichnamigen lokalen Objekten 
 Benötigt ein ausgewähltes Objekt eine ausgeschlossene Grundlage, muss diese passend im Ziel
 vorhanden sein. Die Anwendung kann nicht aus Metadaten allein garantieren, dass bestehende
 Daten neue Datentypen oder Constraints erfüllen.
+Das gilt auch für Sequenzen in Spalten-Defaults. Eine ausgeschlossene Zieltabelle schützt ihre
+Default-Sequenzen vor DROP und ALTER; fehlende lokale Sequenzen in gewünschten Defaults werden
+vor der Ausgabe gemeldet. Kommentare, Literale und Referenzen auf andere Schemata oder über
+Datenbanklinks werden nicht mit lokalen Sequenzabhängigkeiten verwechselt.
 
 ## Objektmodell und SQL-Planung
 
@@ -105,6 +112,7 @@ Daten neue Datentypen oder Constraints erfüllen.
 - `OracleSqlRenderer` erzeugt Oracle-DDL aus dem Modell, einschließlich Schema-Remapping für
   eingebettete SQL-Ausdrücke. Literale, Kommentare und entfernte DB-Link-Referenzen bleiben erhalten.
 - `OracleSchemaCompare` kapselt Konfiguration, beide Verbindungen und die Dateiausgabe.
+- `OracleDatabaseCapabilities` bestimmt, welche Collation-Klauseln die Zieldatenbank unterstützt.
 
 Sequenzen entstehen vor Tabellen mit Sequenz-Defaults. Fremdschlüssel werden vor betroffenen
 Tabellenänderungen entfernt. Constraint-Namen werden schemaweit freigegeben, bevor sie auf
@@ -112,6 +120,14 @@ anderen Tabellen wiederverwendet werden. Alle Tabellen und Primär-/Unique-Schl�
 vor der Fremdschlüsselphase; auch Selbstreferenzen und FK-Zyklen werden damit unterstützt.
 Views werden nach ihren Abhängigkeiten angelegt und anschließend kompiliert und geprüft.
 Geänderte Indizes werden bei Bedarf ersetzt, Views über `CREATE OR REPLACE VIEW` angepasst.
+Virtuelle Spalten werden vor ihren zu löschenden Grundlagen entfernt. Beim vollständigen
+Spaltenwechsel bleibt eine physische Spalte bis zur Anlage der neuen Spalten erhalten.
+Spaltenabbau erfolgt vor dem abschließenden READ ONLY; nötigenfalls wird eine bereits
+schreibgeschützte Tabelle vorübergehend auf READ WRITE gesetzt.
+
+Bei `MAX_STRING_SIZE=STANDARD`, `COMPATIBLE<12.2` oder im Container `CDB$ROOT` wird die implizite
+Collation `USING_NLS_COMP` ohne verbotene Deklarationsklauseln ausgegeben. Andere Collations
+benötigen ein entsprechend konfiguriertes Ziel und werden andernfalls ausdrücklich abgelehnt.
 
 Der Definitionsvergleich ignoriert laufende Sequenzpositionen und berücksichtigt Unterschiede
 in generierten Constraint-Namen semantisch. Neue Sequenzen beginnen beim gelesenen Dictionary-Stand.
@@ -131,6 +147,9 @@ Bitmap-Join-Indizes, Reference-Partitionierung, Objekt-/Nested-/IOT-Tabellen sow
 Subpartition-Templates. Materialized Views einschließlich ihrer Speicher-/Logtabellen werden
 nicht abgeglichen. Grants, Kommentare, Trigger, Packages, Types und Synonyme gehören ebenfalls
 nicht zum Abgleich; benötigte externe Ressourcen müssen im Ziel bereits existieren.
+Partitionierte externe Tabellen werden ausdrücklich abgelehnt: Ihre partitionsbezogenen
+Dateiquellen und Zugriffsparameter sind noch nicht vollständig im Modell enthalten. Normale
+partitionierte Tabellen und nicht partitionierte externe Tabellen bleiben unterstützt.
 
 Weitere ausdrücklich abgelehnte Varianten sind verschlüsselte oder partitionierte LOBs,
 interne LOB-Strukturen etwa für XMLType sowie LOB-`RETENTION MAX`, deren notwendige MAXSIZE
@@ -139,6 +158,12 @@ LOB-Speicherung benötigen ebenfalls einen eigenen Migrationsplan. Besondere Vie
 (etwa Editioning, eigene Constraints, unsichtbare Spalten oder abweichende Default-Collation)
 werden nicht in eine gewöhnliche View umgewandelt. Mehrdeutige Kombinationen mehrerer
 `IS NOT NULL`-Constraints auf derselben Spalte werden abgelehnt, statt ungültige DDL zu erzeugen.
+Dies gilt auch für Views mit `WITH CHECK OPTION`. Vollständige Spaltenwechsel, die wegen
+LONG-/LONG-RAW- oder 1000-Spalten-Grenzen keine Übergangsspalte erlauben, benötigen einen eigenen
+Migrationsplan; einzelne Spaltenwechsel werden durch frühzeitiges Entfernen überzähliger Spalten
+innerhalb dieser Grenzen gehalten. Zwischenzustände ohne physische oder sichtbare Spalte werden
+ebenfalls abgelehnt. Globale HASH-Indizes mit abweichender Kompression einzelner Partitionen
+benötigen einen eigenen Migrationsplan, da CREATE INDEX diese Kombination nicht direkt erlaubt.
 Der Referenzschemaname darf in eingebettetem SQL nicht zugleich als Tabellenalias vorkommen;
 dynamisches SQL innerhalb von Literalen wird nicht umgeschrieben.
 
@@ -200,7 +225,9 @@ Die vom Referenzschema verwendeten Tablespaces müssen auch im Ziel vorhanden se
 Die getrennten Fixtures `tests/oracle/reference.sql` und `tests/oracle/target.sql` sind
 schemaneutral. Sie enthalten normale Tabellen und Indizes, Constraint-Wechsel zwischen Tabellen,
 FK-Ketten und -Zyklen, Views und Sequenzen sowie RANGE-/LIST-Tabellen, lokale Indizes und einen
-global RANGE-partitionierten Index. `external-data.sql` erzeugt eine externe Data-Pump-Tabelle
+global RANGE-partitionierten Index.
+Ein globaler HASH-Index sowie Spaltenwechsel mit virtuellen Spalten, LONG und READ ONLY decken
+die zusätzlichen DDL-Regressionen ab. `external-data.sql` erzeugt eine externe Data-Pump-Tabelle
 mit einer eindeutigen Datei in `EXPORT_HOST`. Bei getrennten Hosts wird dieselbe Testdatei auch
 über die Zielverbindung erzeugt; bei gemeinsamem Directory wird sie wiederverwendet.
 

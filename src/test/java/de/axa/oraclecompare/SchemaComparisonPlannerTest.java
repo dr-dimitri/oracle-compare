@@ -228,6 +228,87 @@ class SchemaComparisonPlannerTest {
     }
 
     @Test
+    void rejectsMissingExcludedSequenceRequiredByNewTableDefault() {
+        for (String expression : List.of("\"SOURCE\".\"ID_SEQ\".NEXTVAL", "id_seq.nextval")) {
+            Fixture source = new Fixture("SOURCE").sequence(sequence("ID_SEQ", "100"))
+                    .table(tableWithDefault("T", expression));
+            SQLException failure = assertThrows(SQLException.class, () -> plan(source, new Fixture("TARGET"), "id_seq"));
+            assertTrue(failure.getMessage().contains("T.ID"), failure.getMessage());
+            assertTrue(failure.getMessage().contains("ID_SEQ"), failure.getMessage());
+        }
+    }
+
+    @Test
+    void allowsNewTableDefaultWhenExcludedSequenceAlreadyExistsInTarget() throws Exception {
+        Fixture source = new Fixture("SOURCE").sequence(sequence("ID_SEQ", "100"))
+                .table(tableWithDefault("T", "SOURCE.ID_SEQ.NEXTVAL"));
+        Fixture target = new Fixture("TARGET").sequence(sequence("ID_SEQ", "20"));
+        String sql = plan(source, target, "id_seq");
+        assertTrue(sql.contains("CREATE TABLE \"TARGET\".\"T\""), sql);
+        assertFalse(sql.contains("CREATE SEQUENCE"), sql);
+    }
+
+    @Test
+    void excludedTargetTablePreventsDroppingSequenceUsedByItsDefault() {
+        Fixture target = new Fixture("TARGET").sequence(sequence("ID_SEQ", "20"))
+                .table(tableWithDefault("KEEP", "\"TARGET\".\"ID_SEQ\".NEXTVAL"));
+        SQLException failure = assertThrows(SQLException.class, () -> plan(new Fixture("SOURCE"), target, "keep"));
+        assertTrue(failure.getMessage().contains("KEEP"), failure.getMessage());
+        assertTrue(failure.getMessage().contains("ID_SEQ"), failure.getMessage());
+    }
+
+    @Test
+    void excludedTargetTablePreventsChangingSequenceUsedByItsDefault() {
+        Fixture source = new Fixture("SOURCE").sequence(new Sequence("ID_SEQ", "1", "9999999999999999999999999999",
+                "2", "20", false, false, "100", Map.of()));
+        Fixture target = new Fixture("TARGET").sequence(sequence("ID_SEQ", "20"))
+                .table(tableWithDefault("KEEP", "id_seq.currval"));
+        SQLException failure = assertThrows(SQLException.class, () -> plan(source, target, "keep"));
+        assertTrue(failure.getMessage().contains("KEEP"), failure.getMessage());
+    }
+
+    @Test
+    void excludedTargetTableDoesNotTreatSequenceRuntimePositionAsChange() throws Exception {
+        Fixture source = new Fixture("SOURCE").sequence(sequence("ID_SEQ", "1000"));
+        Fixture target = new Fixture("TARGET").sequence(sequence("ID_SEQ", "20"))
+                .table(tableWithDefault("KEEP", "TARGET.ID_SEQ.NEXTVAL"));
+        assertNoChanges(plan(source, target, "keep"));
+    }
+
+    @Test
+    void remoteSequencesAndDefaultLiteralsDoNotBlockRemovalOfSameNamedLocalSequence() throws Exception {
+        for (String expression : List.of("OTHER.ID_SEQ.NEXTVAL", "TARGET.ID_SEQ.NEXTVAL@REMOTE", "'ID_SEQ.NEXTVAL'")) {
+            Fixture source = new Fixture("SOURCE").table(tableWithDefault("NEW_TABLE", expression));
+            Fixture target = new Fixture("TARGET").sequence(sequence("ID_SEQ", "20"))
+                    .table(tableWithDefault("KEEP", expression));
+            String sql = plan(source, target, "keep");
+            assertTrue(sql.contains("DROP SEQUENCE \"TARGET\".\"ID_SEQ\";"), sql);
+        }
+    }
+
+    @Test
+    void rejectsForeignKeyNameOccupiedByAnotherExcludedTargetTable() {
+        Fixture source = new Fixture("SOURCE").table(table("P", pk("P_PK")))
+                .table(table("C", fk("FK_MOVED", "SOURCE", "P"))).table(table("KEEP"));
+        Fixture target = new Fixture("TARGET").table(table("P", pk("P_PK")))
+                .table(table("C")).table(table("KEEP", fk("FK_MOVED", "TARGET", "P")));
+        SQLException failure = assertThrows(SQLException.class, () -> plan(source, target, "keep"));
+        assertTrue(failure.getMessage().contains("Constraintname FK_MOVED"), failure.getMessage());
+        assertTrue(failure.getMessage().contains("KEEP"), failure.getMessage());
+    }
+
+    @Test
+    void foreignKeyOnExcludedReferenceTableDoesNotHideUnwantedKeyOnSelectedTargetTable() throws Exception {
+        Fixture source = new Fixture("SOURCE").table(table("P", pk("P_PK")))
+                .table(table("C")).table(table("KEEP", fk("FK_MOVED", "SOURCE", "P")));
+        Fixture target = new Fixture("TARGET").table(table("P", pk("P_PK")))
+                .table(table("C", fk("FK_MOVED", "TARGET", "P"))).table(table("KEEP"));
+        String sql = plan(source, target, "keep");
+        assertTrue(sql.contains("ALTER TABLE \"TARGET\".\"C\" DROP CONSTRAINT \"FK_MOVED\";"), sql);
+        assertFalse(sql.contains("ADD CONSTRAINT \"FK_MOVED\""), sql);
+    }
+
+    @Test
     void createsBaseViewsBeforeDependentViewsAndCompilesAfterCreation() throws Exception {
         Fixture source = new Fixture("SOURCE").table(table("T"));
         source.view("Z_BASE", "SELECT ID FROM \"SOURCE\".\"T\"", "T");
@@ -293,6 +374,14 @@ class SchemaComparisonPlannerTest {
 
     private static Table table(String name, Constraint... constraints) {
         return new Table(name, List.of(number("ID")), List.of(constraints), Map.of(), null, null);
+    }
+
+    private static Table tableWithDefault(String name, String expression) {
+        boolean literal = expression.startsWith("'");
+        Column column = new Column("ID", literal ? "VARCHAR2" : "NUMBER", null, literal ? 100 : 22,
+                null, null, literal ? "C" : null, literal ? 100 : null,
+                expression, true, false, false, false, null, null);
+        return new Table(name, List.of(column), List.of(), Map.of(), null, null);
     }
 
     private static Constraint pk(String name) { return primaryKey(name, false, null, null); }

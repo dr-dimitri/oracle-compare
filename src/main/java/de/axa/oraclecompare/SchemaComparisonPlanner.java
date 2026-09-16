@@ -27,6 +27,15 @@ import java.util.TreeSet;
  * werden keine Tabellen als Ersatz für eine nicht unterstützte ALTER-Operation neu angelegt.
  */
 final class SchemaComparisonPlanner {
+    private final boolean targetSupportsCollation;
+
+    SchemaComparisonPlanner() { this(true); }
+
+    /** Verwendet für Vergleich und SQL dieselben Collation-Fähigkeiten der Zieldatenbank. */
+    SchemaComparisonPlanner(boolean targetSupportsCollation) {
+        this.targetSupportsCollation = targetSupportsCollation;
+    }
+
     /** Liefert ein vollständiges SQL*Plus-/SQLcl-Skript; die Modelle werden nicht verändert. */
     String plan(SchemaDefinition reference, SchemaDefinition target, ExclusionFilter exclusions) throws SQLException {
         return comparisonPlan(reference, target, exclusions).script();
@@ -37,8 +46,8 @@ final class SchemaComparisonPlanner {
         Scope scope = new Scope(normalizeGeneratedNames(reference, target, exclusions), target, exclusions);
         SchemaDefinition desired = scope.desired;
         SchemaDefinition actual = scope.actual;
-        OracleSqlRenderer render = new OracleSqlRenderer(desired.owner(), actual.owner());
-        OracleSqlRenderer oldRender = new OracleSqlRenderer(actual.owner(), actual.owner());
+        OracleSqlRenderer render = new OracleSqlRenderer(desired.owner(), actual.owner(), targetSupportsCollation);
+        OracleSqlRenderer oldRender = new OracleSqlRenderer(actual.owner(), actual.owner(), targetSupportsCollation);
         Set<String> changedTables = difference(actual.tables().keySet(), desired.tables().keySet());
         List<Operation> tableStatements = new ArrayList<>();
         for (Table table : new TreeMap<>(desired.tables()).values()) {
@@ -84,8 +93,15 @@ final class SchemaComparisonPlanner {
                 changedViews.add(view.name());
             }
         }
-        scope.validate(changedTables, changedViews, desiredBacking, actualBacking);
-        validateRequiredDependencies(scope, render);
+        Set<String> changedSequences = difference(actual.sequences().keySet(), desired.sequences().keySet());
+        for (Sequence sequence : desired.sequences().values()) {
+            Sequence old = actual.sequences().get(sequence.name());
+            if (old != null && !render.sequence(sequence, false).equals(oldRender.sequence(old, false))) {
+                changedSequences.add(sequence.name());
+            }
+        }
+        scope.validate(changedTables, changedViews, changedSequences);
+        validateRequiredDependencies(scope);
         boolean resetForeignKeys = !changedTables.isEmpty()
                 || !foreignKeySignatures(desired, render).equals(foreignKeySignatures(actual, oldRender));
         List<Operation> commands = new ArrayList<>();
@@ -142,8 +158,8 @@ final class SchemaComparisonPlanner {
 
     /** Generierte Constraint-/Indexnamen sind Datenbankdetails, keine fachlichen Unterschiede. */
     private SchemaDefinition normalizeGeneratedNames(SchemaDefinition reference, SchemaDefinition actual, ExclusionFilter exclusions) throws SQLException {
-        OracleSqlRenderer desiredRenderer = new OracleSqlRenderer(reference.owner(), actual.owner());
-        OracleSqlRenderer actualRenderer = new OracleSqlRenderer(actual.owner(), actual.owner());
+        OracleSqlRenderer desiredRenderer = new OracleSqlRenderer(reference.owner(), actual.owner(), targetSupportsCollation);
+        OracleSqlRenderer actualRenderer = new OracleSqlRenderer(actual.owner(), actual.owner(), targetSupportsCollation);
         Map<String, String> renamedIndexes = new HashMap<>();
         Set<String> reservedConstraints = new HashSet<>(actual.constraintTables().keySet());
         Set<String> reservedIndexes = new HashSet<>(actual.indexes().keySet());
@@ -264,7 +280,21 @@ final class SchemaComparisonPlanner {
     }
 
     /** Prüft ausgeschlossene Referenzziele und verhindert Skripte, deren Grundlagen fehlen. */
-    private static void validateRequiredDependencies(Scope scope, OracleSqlRenderer render) throws SQLException {
+    private static void validateRequiredDependencies(Scope scope) throws SQLException {
+        Set<String> availableSequences = new HashSet<>(scope.desired.sequences().keySet());
+        for (String sequence : scope.target.sequences().keySet()) {
+            if (scope.exclusions.excludes(sequence)) availableSequences.add(sequence);
+        }
+        for (Table table : scope.desired.tables().values()) for (Column column : table.columns()) {
+            if (column.identity() != null || column.virtual() || column.defaultExpression() == null) continue;
+            String expression = SqlText.remap(column.defaultExpression(), scope.reference.owner(), scope.target.owner());
+            for (String sequence : SqlText.localSequenceReferences(expression, scope.target.owner())) {
+                if (!availableSequences.contains(sequence)) {
+                    throw new SQLException("Default von " + table.name() + "." + column.name()
+                            + " benötigt Sequenz " + sequence + ", die nach dem Abgleich im Ziel fehlt.");
+                }
+            }
+        }
         for (Table table : scope.desired.tables().values()) for (Constraint constraint : table.constraints()) {
             if ("R".equals(constraint.type()) && scope.reference.owner().equals(constraint.referencedOwner())
                     && scope.excludedTables.contains(constraint.referencedTable()) && !scope.target.tables().containsKey(constraint.referencedTable())) {
@@ -331,7 +361,6 @@ final class SchemaComparisonPlanner {
         final ExclusionFilter exclusions;
         final Set<String> excludedTables = new HashSet<>();
         final Set<String> excludedIndexes = new HashSet<>();
-        final Set<String> excludedKeys = new HashSet<>();
 
         Scope(SchemaDefinition reference, SchemaDefinition target, ExclusionFilter exclusions) {
             this.reference = reference; this.target = target; this.exclusions = exclusions;
@@ -343,9 +372,6 @@ final class SchemaComparisonPlanner {
                 for (Index index : schema.indexes().values()) {
                     if (exclusions.excludes(index.name()) || excludedTables.contains(index.tableName())) excludedIndexes.add(index.name());
                 }
-                for (Table table : schema.tables().values()) if (excludedTables.contains(table.name())) {
-                    for (Constraint constraint : table.constraints()) if ("R".equals(constraint.type())) excludedKeys.add(constraint.name());
-                }
             }
             desired = select(reference); actual = select(target);
         }
@@ -354,9 +380,7 @@ final class SchemaComparisonPlanner {
             Map<String, Table> tables = new TreeMap<>(); Map<String, Index> indexes = new TreeMap<>();
             Map<String, View> views = new TreeMap<>(); Map<String, Sequence> sequences = new TreeMap<>();
             schema.tables().forEach((name, table) -> {
-                if (!excludedTables.contains(name)) tables.put(name, new Table(name, table.columns(),
-                        table.constraints().stream().filter(constraint -> !"R".equals(constraint.type()) || !excludedKeys.contains(constraint.name())).toList(),
-                        table.attributes(), table.partitioning(), table.external(), table.lobs()));
+                if (!excludedTables.contains(name)) tables.put(name, table);
             });
             schema.indexes().forEach((name, index) -> { if (!excludedIndexes.contains(name)) indexes.put(name, index); });
             schema.views().forEach((name, view) -> { if (!exclusions.excludes(name)) views.put(name, view); });
@@ -364,7 +388,7 @@ final class SchemaComparisonPlanner {
             return new SchemaDefinition(schema.owner(), tables, indexes, views, sequences, schema.viewDependencies(), schema.incomingForeignKeys(), schema.excludedTables(), schema.constraintTables());
         }
 
-        void validate(Set<String> changedTables, Set<String> changedViews, Map<String, String> desiredBacking, Map<String, String> actualBacking) throws SQLException {
+        void validate(Set<String> changedTables, Set<String> changedViews, Set<String> changedSequences) throws SQLException {
             for (SchemaDefinition schema : List.of(reference, target)) for (Index index : schema.indexes().values()) {
                 if (!excludedIndexes.contains(index.name())) continue;
                 if (changedTables.contains(index.tableName()) || schema == target && !changedTables.isEmpty() && "YES".equals(index.attributes().get("JOIN_INDEX"))) {
@@ -378,9 +402,20 @@ final class SchemaComparisonPlanner {
                 }
             }
             for (Table table : target.tables().values()) for (Constraint constraint : table.constraints()) {
-                if ("R".equals(constraint.type()) && (excludedTables.contains(table.name()) || excludedKeys.contains(constraint.name()))
+                if ("R".equals(constraint.type()) && excludedTables.contains(table.name())
                         && (changedTables.contains(table.name()) || target.owner().equals(constraint.referencedOwner()) && changedTables.contains(constraint.referencedTable()))) {
                     throw new SQLException("Ausgeschlossener Fremdschlüssel " + constraint.name() + " schützt Tabelle " + constraint.referencedTable() + ".");
+                }
+            }
+            for (Table table : target.tables().values()) if (excludedTables.contains(table.name())) {
+                for (Column column : table.columns()) {
+                    if (column.identity() != null || column.virtual()) continue;
+                    for (String sequence : SqlText.localSequenceReferences(column.defaultExpression(), target.owner())) {
+                        if (changedSequences.contains(sequence)) {
+                            throw new SQLException("Ausgeschlossene Tabelle " + table.name() + " benötigt Sequenz " + sequence
+                                    + " im Default von Spalte " + column.name() + " und schützt sie vor der geplanten Änderung.");
+                        }
+                    }
                 }
             }
             Set<String> changedObjects = new HashSet<>(changedTables); changedObjects.addAll(changedViews);
@@ -395,7 +430,7 @@ final class SchemaComparisonPlanner {
             }
             for (Table table : desired.tables().values()) for (Constraint constraint : table.constraints()) {
                 String occupied = target.constraintTables().get(constraint.name());
-                if (occupied != null && (!actual.tables().containsKey(occupied) || excludedKeys.contains(constraint.name()))) {
+                if (occupied != null && !actual.tables().containsKey(occupied)) {
                     throw new SQLException("Constraintname " + constraint.name() + " ist durch ausgeschlossenes Objekt " + occupied + " belegt.");
                 }
             }

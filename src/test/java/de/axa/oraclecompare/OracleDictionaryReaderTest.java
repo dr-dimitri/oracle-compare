@@ -87,6 +87,28 @@ class OracleDictionaryReaderTest {
         assertTrue(assertThrows(SQLException.class, jdbc::read).getMessage().contains("Identity-Definition"));
     }
 
+    @Test void excludedTableKeepsSequenceDefaultsWithoutValidatingUnsupportedColumnMetadata() throws Exception {
+        Jdbc jdbc = baseTable();
+        jdbc.rows("dba_tab_cols", row("TABLE_NAME", "T", "COLUMN_NAME", "ID", "DATA_TYPE", "UNSUPPORTED_TYPE",
+                "DATA_LENGTH", "too large", "DATA_PRECISION", "invalid", "DATA_DEFAULT", " \"APP\".\"S\".NEXTVAL "),
+                row("TABLE_NAME", "T", "COLUMN_NAME", "NOTE", "DATA_DEFAULT", "NULL"));
+        List<SchemaDefinition.Column> columns = jdbc.read(new ExclusionFilter(List.of("t"))).tables().get("T").columns();
+        assertEquals(List.of("ID", "NOTE"), columns.stream().map(SchemaDefinition.Column::name).toList());
+        assertEquals("\"APP\".\"S\".NEXTVAL", columns.get(0).defaultExpression());
+        assertNull(columns.get(0).dataType());
+        assertNull(columns.get(1).defaultExpression());
+    }
+
+    @Test void excludedIdentityNeverExposesItsInternalSequenceAsADependency() throws Exception {
+        Jdbc jdbc = baseTable();
+        jdbc.rows("dba_tab_cols", row("TABLE_NAME", "T", "COLUMN_NAME", "ID", "IDENTITY_COLUMN", "YES",
+                "DATA_DEFAULT", "\"APP\".\"ISEQ$$_1\".NEXTVAL"));
+        // Das ausgeschlossene Objekt benötigt auch bei fehlenden Identity-Details keine Validierung.
+        SchemaDefinition.Column column = jdbc.read(new ExclusionFilter(List.of("T"))).tables().get("T").columns().get(0);
+        assertNull(column.defaultExpression());
+        assertNull(column.identity());
+    }
+
     @Test void constraintExpressionAndGeneratedNameArePreserved() throws Exception {
         Jdbc jdbc = baseTable();
         jdbc.rows("dba_cons_columns", row("CONSTRAINT_NAME", "SYS_C1", "COLUMN_NAME", "ID"));
@@ -195,6 +217,26 @@ class OracleDictionaryReaderTest {
         assertTrue(assertThrows(SQLException.class, jdbc::read).getMessage().contains("LOB"));
     }
 
+    @Test void lobsOutsideTheTableInventoryDoNotAbortComparison() throws Exception {
+        Jdbc jdbc = baseTable();
+        // DBA_TABLES-Inventur hat Materialized Views, Logs, Recycle-Bin und Nested Tables bereits ausgefiltert.
+        jdbc.rows("dba_lobs", row("TABLE_NAME", "MV_DATA", "PARTITIONED", "YES"),
+                row("TABLE_NAME", "MLOG$_DATA", "ENCRYPT", "YES"),
+                row("TABLE_NAME", "BIN$DATA", "RETENTION_TYPE", "MAX"),
+                row("TABLE_NAME", "NESTED_DATA", "COLUMN_NAME", "SYS_NC1$"));
+        assertEquals(List.of("T"), List.copyOf(jdbc.read().tables().keySet()));
+        assertTrue(jdbc.sql.stream().noneMatch(sql -> sql.contains("FROM dba_segments")));
+    }
+
+    @Test void excludingAllTablesSkipsTheirLobValidationAndUninventoriedLobs() throws Exception {
+        Jdbc jdbc = baseTable();
+        jdbc.rows("dba_lobs", row("TABLE_NAME", "T", "PARTITIONED", "YES"),
+                row("TABLE_NAME", "MV_DATA", "PARTITIONED", "YES"));
+        SchemaDefinition definition = jdbc.read(new ExclusionFilter(List.of("*")));
+        assertTrue(definition.excludedTables().contains("T"));
+        assertTrue(definition.tables().get("T").lobs().isEmpty());
+    }
+
     @Test void rowArchivalIsDetectedViaItsHiddenSystemColumn() {
         Jdbc jdbc = baseTable();
         jdbc.extra = (sql, bindings) -> sql.contains("column_name = 'ORA_ARCHIVE_STATE'") ? List.of(row("TABLE_NAME", "T")) : null;
@@ -229,6 +271,25 @@ class OracleDictionaryReaderTest {
         assertEquals("NOLOGFILE", external.accessParameters());
         assertEquals(2, external.locations().size());
         assertEquals("ARCHIVE", external.locations().get(1).directory());
+    }
+
+    @Test void partitionedExternalTableIsRejectedBeforeLosingItsPartitionLocations() {
+        Jdbc jdbc = partitionedExternalTable();
+        SQLException failure = assertThrows(SQLException.class, jdbc::read);
+        assertTrue(failure.getMessage().contains("APP.T"));
+        assertTrue(failure.getMessage().contains("partitionierte externe Tabelle"));
+        assertTrue(jdbc.sql.stream().noneMatch(sql -> sql.contains("FROM dba_external_locations")));
+        assertTrue(jdbc.sql.stream().noneMatch(sql -> sql.contains("FROM dba_tab_partitions")));
+        assertEquals(jdbc.statements, jdbc.closedStatements);
+        assertEquals(jdbc.statements, jdbc.closedResults);
+    }
+
+    @Test void excludedPartitionedExternalTableDoesNotRequirePartitionOrLocationMetadata() throws Exception {
+        Jdbc jdbc = partitionedExternalTable();
+        SchemaDefinition definition = jdbc.read(new ExclusionFilter(List.of("t")));
+        assertTrue(definition.excludedTables().contains("T"));
+        assertNull(definition.tables().get("T").external());
+        assertNull(definition.tables().get("T").partitioning());
     }
 
     @Test void rangePartitionBoundsAndBlockStorageAreReadCorrectly() throws Exception {
@@ -314,6 +375,24 @@ class OracleDictionaryReaderTest {
         assertEquals("V", jdbc.read(new ExclusionFilter(List.of("V"))).constraintTables().get("V_PK"));
     }
 
+    @Test void checkOptionViewIsRejectedAndItsExcludedConstraintNameRemainsProtected() throws Exception {
+        Jdbc jdbc = new Jdbc();
+        jdbc.rows("dba_views", row("VIEW_NAME", "V", "TEXT", "SELECT ID FROM T WHERE ID > 0"));
+        Map<String, String> check = row("TABLE_NAME", "V", "CONSTRAINT_NAME", "V_CHECK", "CONSTRAINT_TYPE", "V", "GENERATED", "USER NAME");
+        jdbc.extra = (sql, bindings) -> {
+            if (sql.contains("FROM dba_constraints c WHERE")) {
+                // Ein Dictionary-Stub muss hier den Typfilter beachten, sonst verdeckt er den ursprünglichen Fehler.
+                return sql.contains("'V'") ? List.of(check) : List.of();
+            }
+            return null;
+        };
+        jdbc.rows("dba_constraints", check);
+        assertTrue(assertThrows(SQLException.class, jdbc::read).getMessage().contains("View-Constraints"));
+        SchemaDefinition excluded = jdbc.read(new ExclusionFilter(List.of("v")));
+        assertTrue(excluded.views().containsKey("V"));
+        assertEquals("V", excluded.constraintTables().get("V_CHECK"));
+    }
+
     @Test void alteredVisibilityOnViewsCannotMisassignAliasColumns() {
         Jdbc jdbc = new Jdbc();
         jdbc.rows("dba_views", row("VIEW_NAME", "V", "TEXT", "SELECT A, B FROM T"));
@@ -356,6 +435,14 @@ class OracleDictionaryReaderTest {
     private static Jdbc baseTable() {
         Jdbc jdbc = new Jdbc();
         jdbc.rows("dba_tables", row("TABLE_NAME", "T", "TEMPORARY", "N"));
+        return jdbc;
+    }
+
+    private static Jdbc partitionedExternalTable() {
+        Jdbc jdbc = baseTable();
+        jdbc.rows("dba_part_tables", row("TABLE_NAME", "T", "PARTITIONING_TYPE", "RANGE", "SUBPARTITIONING_TYPE", "NONE"));
+        jdbc.rows("dba_external_tables", row("TABLE_NAME", "T", "TYPE_NAME", "ORACLE_LOADER",
+                "DEFAULT_DIRECTORY_NAME", "EXPORT_HOST", "ACCESS_TYPE", "CLOB", "REJECT_LIMIT", "UNLIMITED"));
         return jdbc;
     }
 

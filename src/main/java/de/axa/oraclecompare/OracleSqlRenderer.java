@@ -4,6 +4,7 @@ import static de.axa.oraclecompare.SchemaDefinition.*;
 
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -19,8 +20,16 @@ import java.util.stream.Collectors;
 final class OracleSqlRenderer {
     private final String source;
     private final String target;
+    private final boolean targetSupportsCollation;
 
-    OracleSqlRenderer(String source, String target) { this.source = source; this.target = target; }
+    OracleSqlRenderer(String source, String target) { this(source, target, true); }
+
+    /** Die Zielplattform bestimmt, ob explizite Collation-Klauseln zulässig sind. */
+    OracleSqlRenderer(String source, String target, boolean targetSupportsCollation) {
+        this.source = source;
+        this.target = target;
+        this.targetSupportsCollation = targetSupportsCollation;
+    }
 
     String qualified(String name) { return SqlText.qualified(target, name); }
     String expression(String value) {
@@ -41,7 +50,7 @@ final class OracleSqlRenderer {
         for (Column column : table.columns()) columns.add(column(table, column));
         if (columns.isEmpty()) throw unsupported(table.name(), "Tabelle ohne auswertbare Spalten");
         sql.append(String.join(",\n  ", columns)).append("\n)");
-        if (table.attributes().get("DEFAULT_COLLATION") != null) sql.append(" DEFAULT COLLATION ").append(SqlText.identifier(table.attributes().get("DEFAULT_COLLATION")));
+        sql.append(collation(table.attributes().get("DEFAULT_COLLATION"), " DEFAULT COLLATION "));
         if (table.external() != null) {
             if (temporary) throw unsupported(table.name(), "temporäre externe Tabelle");
             sql.append("\n").append(external(table.external()));
@@ -72,16 +81,12 @@ final class OracleSqlRenderer {
         if (column.virtual()) {
             if (column.defaultExpression() == null) throw unsupported(column.name(), "virtuelle Spalte ohne Ausdruck");
             sql.append(' ').append(dataType(column));
-            if (column.collation() != null && !"USING_NLS_COMP".equals(column.collation())) {
-                sql.append(" COLLATE ").append(SqlText.identifier(column.collation()));
-            }
+            sql.append(collation(column.collation(), " COLLATE "));
             if (column.invisible()) sql.append(" INVISIBLE");
             sql.append(" GENERATED ALWAYS AS (").append(expression(column.defaultExpression())).append(") VIRTUAL");
         } else {
             sql.append(' ').append(dataType(column));
-            if (column.collation() != null) {
-                sql.append(" COLLATE ").append(SqlText.identifier(column.collation()));
-            }
+            sql.append(collation(column.collation(), " COLLATE "));
             if (column.invisible()) sql.append(" INVISIBLE");
             if (column.identity() != null) sql.append(' ').append(identity(column.identity()));
             else if (defaultExpression(column) != null) {
@@ -91,6 +96,19 @@ final class OracleSqlRenderer {
             }
         }
         return sql.toString();
+    }
+
+    /**
+     * Bei STANDARD ist USING_NLS_COMP implizit und darf nicht explizit deklariert werden.
+     * Andere Collations lassen sich dort nicht erhalten und führen vor der Ausgabe zum Fehler.
+     */
+    private String collation(String value, String clause) throws SQLException {
+        if (value == null) return "";
+        if (!targetSupportsCollation) {
+            if ("USING_NLS_COMP".equals(value)) return "";
+            throw unsupported(target, "Collation " + value + " benötigt MAX_STRING_SIZE=EXTENDED und COMPATIBLE>=12.2 im Ziel");
+        }
+        return clause + SqlText.identifier(value);
     }
 
     /** DEFAULT NULL ist nach Oracle-DDL derselbe Zustand wie ein fehlender Default. */
@@ -190,6 +208,7 @@ final class OracleSqlRenderer {
 
     /** Indexe werden einschließlich funktionaler Ausdrücke und Partitionierung eigenständig angelegt. */
     String index(Index index) throws SQLException {
+        validateHashIndexCompression(index);
         String type = index.attributes().getOrDefault("INDEX_TYPE", "NORMAL");
         boolean bitmap = type.contains("BITMAP");
         if (!Set.of("NORMAL", "NORMAL/REV", "BITMAP", "FUNCTION-BASED NORMAL", "FUNCTION-BASED NORMAL/REV", "FUNCTION-BASED BITMAP").contains(type)) {
@@ -208,6 +227,22 @@ final class OracleSqlRenderer {
         if (type.endsWith("/REV")) sql.append(" REVERSE");
         if ("INVISIBLE".equals(index.attributes().get("VISIBILITY"))) sql.append(" INVISIBLE");
         return sql.append(';').toString();
+    }
+
+    /** CREATE erlaubt bei globalen HASH-Partitionen keine vom Index abweichende Kompression. */
+    private static void validateHashIndexCompression(Index index) throws SQLException {
+        Partitioning partitioning = index.partitioning();
+        if (partitioning == null || partitioning.local() || !"HASH".equals(partitioning.method())) return;
+        String compression = index.attributes().getOrDefault("COMPRESSION", "DISABLED");
+        for (Partition partition : partitioning.partitions()) {
+            String individual = partition.attributes().get("COMPRESSION");
+            String prefix = partition.attributes().get("PREFIX_LENGTH");
+            if (individual != null && !individual.equals(compression)
+                    || "ENABLED".equals(individual) && prefix != null && !prefix.equals(index.attributes().get("PREFIX_LENGTH"))) {
+                throw unsupported(index.name() + "." + partition.name(),
+                        "abweichende Kompression einer globalen HASH-Indexpartition benötigt einen eigenen Migrationsplan");
+            }
+        }
     }
 
     /** Constraint-Zustände und referenzierte Spalten werden vollständig übernommen. */
@@ -366,7 +401,11 @@ final class OracleSqlRenderer {
         // Oracle erlaubt bei HASH-Partitionen und LIST/HASH-Subpartitionen nur Tablespace/Kompression.
         if ("HASH".equals(method) || sub) {
             Map<String, String> limited = new TreeMap<>();
-            for (String key : List.of("TABLESPACE_NAME", "COMPRESSION", "COMPRESS_FOR")) {
+            // Globale HASH-Indexpartitionen erlauben ausschließlich TABLESPACE; Kompression
+            // wird am Index selbst deklariert. Tabellenpartitionen haben eine andere Grammatik.
+            List<String> allowed = index && !local && "HASH".equals(method)
+                    ? List.of("TABLESPACE_NAME") : List.of("TABLESPACE_NAME", "COMPRESSION", "COMPRESS_FOR");
+            for (String key : allowed) {
                 if (partition.attributes().get(key) != null) limited.put(key, partition.attributes().get(key));
             }
             append(sql, physical(limited, index));
@@ -466,13 +505,30 @@ final class OracleSqlRenderer {
             if (!oldColumns.containsKey(column.name())) seenNew = true;
             else if (seenNew) throw unsupported(desired.name(), "neue Spalte innerhalb der bestehenden Spaltenreihenfolge");
         }
-        for (Column column : actual.columns()) if (!newColumns.containsKey(column.name())) {
-            sql.add("ALTER TABLE " + qualified(desired.name()) + " DROP COLUMN " + SqlText.identifier(column.name()) + ";");
+        List<Column> remaining = new ArrayList<>(actual.columns());
+        // Virtuelle Spalten zuerst lösen, bevor ihre physischen Grundlagen verändert werden.
+        for (Column column : actual.columns()) if (column.virtual() && !newColumns.containsKey(column.name())) {
+            dropColumn(desired.name(), column, remaining, sql);
         }
+        // Bei einem vollständigen Wechsel bleibt genau eine physische Spalte bis nach ADD
+        // bestehen. Sonst früh löschen, damit LONG- und Spaltenanzahlgrenzen gewahrt bleiben.
+        List<Column> removedPhysical = actual.columns().stream()
+                .filter(column -> !column.virtual() && !newColumns.containsKey(column.name())).toList();
+        boolean retainsPhysicalColumn = actual.columns().stream()
+                .anyMatch(column -> !column.virtual() && newColumns.containsKey(column.name()));
+        boolean retainsVisibleColumn = actual.columns().stream()
+                .anyMatch(column -> !column.invisible() && newColumns.containsKey(column.name()));
+        Column heldColumn = (!retainsPhysicalColumn || !retainsVisibleColumn) && !removedPhysical.isEmpty()
+                ? removedPhysical.stream().min(Comparator.comparing((Column column) -> !retainsVisibleColumn && column.invisible())
+                    .thenComparing(OracleSqlRenderer::isLong)).orElseThrow() : null;
+        for (Column column : removedPhysical) if (column != heldColumn) {
+            dropColumn(desired.name(), column, remaining, sql);
+        }
+        List<String> added = new ArrayList<>();
         for (Column column : desired.columns()) {
             Column old = oldColumns.get(column.name());
             if (old == null) {
-                sql.add("ALTER TABLE " + qualified(desired.name()) + " ADD (" + column(desired, column) + ");");
+                added.add(column(desired, column));
                 continue;
             }
             if (column(column).equals(actualRenderer.column(old))) continue;
@@ -486,7 +542,38 @@ final class OracleSqlRenderer {
             if (column.defaultExpression() == null && old.defaultExpression() != null) definition += " DEFAULT NULL";
             sql.add("ALTER TABLE " + qualified(desired.name()) + " MODIFY (" + definition + ");");
         }
+        // Zusammen hinzufügen, damit neue virtuelle Spalten dieselben neuen Basisspalten sehen.
+        // Auch beim kompletten Spaltenwechsel darf die Tabelle nie ohne Spalten sein.
+        if (heldColumn != null && (desired.columns().size() >= 1000
+                || isLong(heldColumn) && desired.columns().stream().anyMatch(OracleSqlRenderer::isLong))) {
+            throw unsupported(desired.name(), "vollständiger Spaltenwechsel mit LONG- oder 1000-Spalten-Grenze benötigt einen eigenen Migrationsplan");
+        }
+        if (!added.isEmpty()) {
+            sql.add("ALTER TABLE " + qualified(desired.name()) + " ADD (" + String.join(", ", added) + ");");
+            desired.columns().stream().filter(column -> !oldColumns.containsKey(column.name())).forEach(remaining::add);
+        }
+        if (heldColumn != null) dropColumn(desired.name(), heldColumn, remaining, sql);
+        boolean wasReadOnly = "YES".equals(actual.attributes().get("READ_ONLY"));
+        boolean wantsReadOnly = "YES".equals(desired.attributes().get("READ_ONLY"));
+        boolean dropsColumns = actual.columns().stream().anyMatch(column -> !newColumns.containsKey(column.name()));
+        boolean unlock = wasReadOnly && (!wantsReadOnly || dropsColumns);
+        if (unlock) sql.add(0, "ALTER TABLE " + qualified(desired.name()) + " READ WRITE;");
+        if (wantsReadOnly && (!wasReadOnly || unlock)) sql.add("ALTER TABLE " + qualified(desired.name()) + " READ ONLY;");
         return sql;
+    }
+
+    private static boolean isLong(Column column) {
+        return "LONG".equals(column.dataType()) || "LONG RAW".equals(column.dataType());
+    }
+
+    /** Jede Zwischenstruktur muss mindestens eine physische und eine sichtbare Spalte besitzen. */
+    private void dropColumn(String table, Column column, List<Column> remaining, List<String> sql) throws SQLException {
+        remaining.remove(column);
+        if (remaining.stream().noneMatch(candidate -> !candidate.virtual())
+                || remaining.stream().noneMatch(candidate -> !candidate.invisible())) {
+            throw unsupported(table, "Spaltenwechsel würde vorübergehend alle physischen oder sichtbaren Spalten entfernen; eigener Migrationsplan erforderlich");
+        }
+        sql.add("ALTER TABLE " + qualified(table) + " DROP COLUMN " + SqlText.identifier(column.name()) + ";");
     }
 
     private static String partitionSignature(Partitioning partition, OracleSqlRenderer renderer) throws SQLException {
@@ -513,8 +600,10 @@ final class OracleSqlRenderer {
             sql.add(prefix + "MOVE TABLESPACE " + SqlText.identifier(changed.remove("TABLESPACE_NAME")) + ";");
         }
         if (changed.containsKey("COMPRESS_FOR")) changed.put("COMPRESSION", desired.attributes().get("COMPRESSION"));
+        // Schreibschutz wird von alterTable vor bzw. nach den Strukturänderungen gesetzt.
+        changed.remove("READ_ONLY");
         Map<String, String> behavior = new TreeMap<>();
-        for (String key : List.of("DEGREE", "CACHE", "ROW_MOVEMENT", "READ_ONLY")) if (changed.containsKey(key)) behavior.put(key, changed.remove(key));
+        for (String key : List.of("DEGREE", "CACHE", "ROW_MOVEMENT")) if (changed.containsKey(key)) behavior.put(key, changed.remove(key));
         String physical = physical(changed, false);
         if (!physical.isBlank()) sql.add(prefix + physical + ";");
         for (var entry : behavior.entrySet()) sql.add(prefix + tableBehavior(Map.of(entry.getKey(), entry.getValue())) + ";");

@@ -1,5 +1,6 @@
 package de.axa.oraclecompare;
 
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
@@ -10,6 +11,41 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /** Sichert das Remapping gegen Veränderungen an SQL-Inhalten und Bezeichnern ab. */
 class SqlTextTest {
+    @Test
+    void findsLocalSequenceDefaultsWithExactQuotedNamesAndUnquotedCaseFolding() {
+        assertEquals(Set.of("ID_SEQ", "Mixed Case", "A\"B"), SqlText.localSequenceReferences(
+                "id_seq.nextval + source.id_seq.currval + \"SOURCE\".\"Mixed Case\".NEXTVAL "
+                        + "+ \"A\"\"B\".CURRVAL + \"source\".WRONG_CASE.NEXTVAL + OTHER.OTHER_SEQ.NEXTVAL", "SOURCE"));
+        assertEquals(Set.of("Seq"), SqlText.localSequenceReferences("\"Source\".\"Seq\".NEXTVAL", "Source"));
+    }
+
+    @Test
+    void findsSequenceReferenceAcrossWhitespaceAndComments() {
+        assertEquals(Set.of("ID_SEQ"), SqlText.localSequenceReferences(
+                "SOURCE /* schema */ . ID_SEQ -- sequence\n . NEXTVAL", "SOURCE"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "'SOURCE.ID_SEQ.NEXTVAL'", "'it''s SOURCE.ID_SEQ.NEXTVAL'", "N'ID_SEQ.NEXTVAL'",
+            "q'[SOURCE.ID_SEQ.NEXTVAL ' S.CURRVAL]'", "NQ'!S.NEXTVAL ' S.CURRVAL!'",
+            "/* SOURCE.ID_SEQ.NEXTVAL */ 42 -- ID_SEQ.CURRVAL", "PACKAGE.SEQ.NEXTVAL",
+            "SOURCE.PACKAGE.SEQ.NEXTVAL", "ID_SEQ.\"nextval\"", "SOURCE.ID_SEQ.NEXTVAL@REMOTE",
+            "ID_SEQ.CURRVAL@SOURCE.EXAMPLE.COM", "\"SOURCE\".\"ID_SEQ\".NEXTVAL@\"R\"\"L\"",
+            "SOURCE /* schema */ . ID_SEQ . NEXTVAL /* object */ @ /* link */ SOURCE . EXAMPLE . COM",
+            "SOURCE.ID_SEQ@REMOTE.NEXTVAL"
+    })
+    void ignoresSequenceLikeLiteralsCommentsForeignSchemasAndRemoteReferences(String expression) {
+        assertEquals(Set.of(), SqlText.localSequenceReferences(expression, "SOURCE"));
+    }
+
+    @Test
+    void keepsLocalSequenceAfterRemoteReferenceAndIgnoresLinkLikeComments() {
+        assertEquals(Set.of("LOCAL_SEQ"), SqlText.localSequenceReferences(
+                "SOURCE.S.NEXTVAL@REMOTE.EXAMPLE.COM + SOURCE /* @REMOTE */ . LOCAL_SEQ.NEXTVAL", "SOURCE"));
+        assertEquals(Set.of(), SqlText.localSequenceReferences(null, "SOURCE"));
+    }
+
     @Test
     void quotesDictionaryNamesAndEscapesEmbeddedQuotes() {
         assertEquals("\"Sales\"\" Europe\"", SqlText.identifier("Sales\" Europe"));
